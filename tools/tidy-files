@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""
+tidy-files — Downloads と Desktop のファイルを種類別フォルダに仕分ける。
+
+安全のための約束:
+  - 既定は「下見」だけ。実際に動かすには --apply を付ける。
+  - アプリ(.app)、フォルダ、ドットファイルには触らない。
+  - 同名ファイルがあっても上書きしない（連番を付ける）。
+  - 動かした記録を残し、--undo で元に戻せる。
+
+    tidy-files              下見（何も動かさない）
+    tidy-files --apply      実際に仕分ける
+    tidy-files --undo       直前の仕分けを元に戻す
+"""
+
+import json
+import os
+import shutil
+import sys
+import time
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+TARGETS = [os.path.join(HOME, "Downloads"), os.path.join(HOME, "Desktop")]
+LOG_DIR = os.path.expanduser("~/.tidy-files")
+LOG_FILE = os.path.join(LOG_DIR, "moves.jsonl")
+
+# 拡張子 -> 入れるフォルダ名
+CATEGORIES = {
+    "書類":       [".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".txt", ".rtf", ".pages", ".numbers", ".key"],
+    "画像":       [".png", ".jpg", ".jpeg", ".gif", ".heic", ".webp", ".bmp", ".tiff", ".svg"],
+    "動画・音声": [".mp4", ".mov", ".avi", ".mkv", ".mp3", ".wav", ".m4a", ".aac", ".flac"],
+    "インストーラ": [".dmg", ".pkg", ".app.zip"],
+    "圧縮ファイル": [".zip", ".tar", ".gz", ".tgz", ".rar", ".7z"],
+    "デザイン":   [".ai", ".psd", ".sketch", ".fig", ".xd"],
+    "メモ":       [".md", ".markdown"],
+    "データ":     [".csv", ".json", ".xml", ".yaml", ".yml", ".sql"],
+    "ウェブ":     [".html", ".htm", ".webloc"],
+}
+
+# 触ってはいけないもの
+SKIP_NAMES = {".DS_Store", ".localized", "Icon\r"}
+SKIP_SUFFIXES = (".app", ".localized")
+
+
+def categorize(filename):
+    lower = filename.lower()
+    for folder, exts in CATEGORIES.items():
+        for ext in exts:
+            if lower.endswith(ext):
+                return folder
+    return None  # 分類できないものは動かさない
+
+
+def unique_path(path):
+    """同名があれば -2, -3 … を付けて衝突を避ける。上書きは絶対にしない。"""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{base}-{n}{ext}"):
+        n += 1
+    return f"{base}-{n}{ext}"
+
+
+def plan():
+    moves = []
+    for target in TARGETS:
+        if not os.path.isdir(target):
+            continue
+        for name in sorted(os.listdir(target)):
+            src = os.path.join(target, name)
+            if name.startswith("."):
+                continue
+            if name in SKIP_NAMES or name.endswith(SKIP_SUFFIXES):
+                continue
+            if not os.path.isfile(src):
+                continue  # フォルダとアプリは触らない
+            folder = categorize(name)
+            if not folder:
+                continue
+            dst_dir = os.path.join(target, folder)
+            dst = unique_path(os.path.join(dst_dir, name))
+            moves.append({"src": src, "dst": dst, "folder": folder, "target": target})
+    return moves
+
+
+def show(moves):
+    if not moves:
+        print("仕分けるファイルはありませんでした。")
+        return
+    by_target = {}
+    for m in moves:
+        by_target.setdefault(m["target"], {}).setdefault(m["folder"], []).append(
+            os.path.basename(m["src"])
+        )
+    for target, folders in by_target.items():
+        print(f"\n【{os.path.basename(target)}】")
+        for folder, names in sorted(folders.items()):
+            print(f"  {folder}/ ← {len(names)}件")
+            for n in names[:6]:
+                print(f"      {n}")
+            if len(names) > 6:
+                print(f"      ほか{len(names) - 6}件")
+    print(f"\n合計 {len(moves)} 件。フォルダやアプリ(.app)には触りません。")
+
+
+def apply(moves):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    stamp = datetime.now().isoformat(timespec="seconds")
+    done = 0
+    with open(LOG_FILE, "a", encoding="utf-8") as log:
+        for m in moves:
+            os.makedirs(os.path.dirname(m["dst"]), exist_ok=True)
+            dst = unique_path(m["dst"])  # 実行直前にもう一度確認
+            try:
+                shutil.move(m["src"], dst)
+            except Exception as e:
+                print(f"  移動できず: {os.path.basename(m['src'])} ({e})")
+                continue
+            log.write(json.dumps({"at": stamp, "src": m["src"], "dst": dst}, ensure_ascii=False) + "\n")
+            done += 1
+    print(f"{done} 件を仕分けました。元に戻すには tidy-files --undo")
+
+
+def undo():
+    if not os.path.isfile(LOG_FILE):
+        print("戻せる記録がありません。")
+        return
+    with open(LOG_FILE, encoding="utf-8") as f:
+        entries = [json.loads(l) for l in f if l.strip()]
+    if not entries:
+        print("戻せる記録がありません。")
+        return
+    last = entries[-1]["at"]
+    batch = [e for e in entries if e["at"] == last]
+    restored = 0
+    for e in reversed(batch):
+        if not os.path.exists(e["dst"]):
+            continue
+        src = unique_path(e["src"])
+        try:
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            shutil.move(e["dst"], src)
+            restored += 1
+        except Exception as ex:
+            print(f"  戻せず: {os.path.basename(e['dst'])} ({ex})")
+    keep = [e for e in entries if e["at"] != last]
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        for e in keep:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    print(f"{restored} 件を元に戻しました（{last} の分）。")
+
+
+def main():
+    if "--undo" in sys.argv:
+        undo()
+        return 0
+    moves = plan()
+    if "--apply" in sys.argv:
+        show(moves)
+        if moves:
+            apply(moves)
+        return 0
+    print("=== 下見（まだ何も動かしていません）===")
+    show(moves)
+    print("\nこの通りで良ければ: tidy-files --apply")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

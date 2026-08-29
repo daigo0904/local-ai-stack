@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""
+research-async — 「調べています」とすぐ返し、調査は裏で続けて結果を Discord に送る。
+
+research-save は完了まで2〜4分かかるため、エージェントに任せると
+「黙って待たされる」か「モデルが自分で完了を待ちに行く」かのどちらかになる。
+このスクリプトは即座に一言返して終了し、実際の調査は子プロセスに任せる。
+モデルの判断に依存しないので確実。
+
+送り先が Discord なのは、LINE の無料枠が月200通しかないため。
+Discord は無制限なので、調査を何回しても枠を気にしなくて済む。
+朝のブリーフィングと気まぐれ声かけは、目に付きやすい LINE のまま。
+
+    research-async "調べたい内容"
+"""
+
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+RESEARCH = os.path.expanduser("~/bin/research-save")
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。
+
+    ここに直書きしない。この一式を公開したときに、
+    自分を指すID（永久に変えられない）が出てしまうため。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+DISCORD_CHANNEL_ID = env_value("DISCORD_CHANNEL_ID")
+DISCORD_API = "https://discord.com/api/v10/channels/{}/messages"
+
+
+def load_token():
+    tok = os.environ.get("DISCORD_BOT_TOKEN")
+    if tok:
+        return tok
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("DISCORD_BOT_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def push_discord(text):
+    """Discord の #agent に送る。送信数の制限は無い。"""
+    token = load_token()
+    if not token:
+        return
+    # Discord の1メッセージ上限は2000文字
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        DISCORD_API.format(DISCORD_CHANNEL_ID), data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bot {token}",
+                 "User-Agent": "research-async (local, 1.0)"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        pass
+
+
+def child(query):
+    """裏で調査して、終わったら結果を LINE に送る。"""
+    try:
+        p = subprocess.run([RESEARCH, query], capture_output=True, text=True, timeout=600)
+        out = (p.stdout or "").strip() or (p.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        out = f"「{query}」の調査が時間内に終わりませんでした。"
+    except Exception as e:
+        out = f"「{query}」の調査に失敗しました: {e}"
+    push_discord(out or f"「{query}」の調査結果を取得できませんでした。")
+
+
+def main():
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        print("使い方: research-async \"調べたいこと\"", file=sys.stderr)
+        return 2
+    query = " ".join(sys.argv[1:]).strip()
+
+    if os.environ.get("RESEARCH_ASYNC_CHILD") == "1":
+        child(query)
+        return 0
+
+    # 子プロセスを切り離して起動する。親はすぐ終わるので待たされない。
+    env = dict(os.environ, RESEARCH_ASYNC_CHILD="1")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), query],
+        env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    print(f"「{query}」について調べてきます。1〜2分ほどでDiscordに結果を送ります。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

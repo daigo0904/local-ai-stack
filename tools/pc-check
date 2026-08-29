@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""
+pc-check — PC の状態を見て、気をつけた方がいいことだけ知らせる。
+
+毎日走らせても普段は黙る。何か引っかかったときだけ Discord に送る。
+見るもの:
+  - ディスクの空き（少ないと作業が止まる）
+  - 大きいファイル（容量を食っている犯人）
+  - AI環境のバックアップが古くないか
+  - 常駐サービスが落ちていないか
+
+    pc-check           問題があれば通知（何もなければ黙る）
+    pc-check --report  問題が無くても状態を表示する
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。
+
+    ここに直書きしない。この一式を公開したときに、
+    自分を指すID（永久に変えられない）が出てしまうため。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+DISCORD_CHANNEL_ID = env_value("DISCORD_CHANNEL_ID")
+BACKUP_DIR = os.path.expanduser("~/バックアップ")
+
+DISK_WARN_PERCENT = 15      # 空きがこれ未満なら警告
+BIG_FILE_GB = 2.0           # これより大きいファイルを報告
+BACKUP_STALE_DAYS = 3       # バックアップがこれ以上古いと警告
+SERVICES = [
+    "ai.openclaw.gateway",
+    "ai.openclaw.line-tunnel",
+    "ai.openclaw.line-proxy",
+    "ai.openclaw.line-sync",
+]
+
+
+def load_token():
+    t = os.environ.get("DISCORD_BOT_TOKEN")
+    if t:
+        return t
+    try:
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line.startswith("DISCORD_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def notify(text):
+    tok = load_token()
+    if not tok:
+        print(text)
+        return
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bot {tok}",
+                 "User-Agent": "pc-check (local, 1.0)"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        pass
+
+
+def check_disk():
+    total, used, free = shutil.disk_usage(os.path.expanduser("~"))
+    pct = free / total * 100
+    line = f"ディスクの空きは {free/1024**3:.0f}GB（全体の{pct:.0f}%）"
+    return (pct < DISK_WARN_PERCENT), line
+
+
+def check_big_files():
+    """ホーム直下の主要な場所だけ見る。全体走査はしない（時間がかかるため）。"""
+    targets = [os.path.expanduser(p) for p in
+               ("~/Downloads", "~/Desktop", "~/Documents", "~/Movies")]
+    big = []
+    for base in targets:
+        if not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and not d.endswith(".app")]
+            for f in files:
+                p = os.path.join(root, f)
+                try:
+                    sz = os.path.getsize(p)
+                except OSError:
+                    continue
+                if sz >= BIG_FILE_GB * 1024**3:
+                    big.append((sz, p))
+    big.sort(reverse=True)
+    return big[:5]
+
+
+def check_backup():
+    if not os.path.isdir(BACKUP_DIR):
+        return True, "AI環境のバックアップがまだありません"
+    files = [os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR)]
+    files = [f for f in files if os.path.isfile(f)]
+    if not files:
+        return True, "AI環境のバックアップがまだありません"
+    newest = max(files, key=os.path.getmtime)
+    age_days = (time.time() - os.path.getmtime(newest)) / 86400
+    line = f"最後のバックアップは{age_days:.0f}日前"
+    return (age_days > BACKUP_STALE_DAYS), line
+
+
+def check_services():
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True,
+                             text=True, timeout=30).stdout
+    except Exception:
+        return [], "常駐サービスの状態を確認できませんでした"
+    dead = [s for s in SERVICES if s not in out]
+    return dead, f"常駐サービス {len(SERVICES)-len(dead)}/{len(SERVICES)} が稼働中"
+
+
+def main():
+    report = "--report" in sys.argv
+    problems, info = [], []
+
+    bad, line = check_disk()
+    (problems if bad else info).append(line)
+
+    big = check_big_files()
+    if big:
+        msg = "容量を食っているファイル:\n" + "\n".join(
+            f"  {sz/1024**3:.1f}GB  {os.path.basename(p)}" for sz, p in big)
+        info.append(msg)
+
+    bad, line = check_backup()
+    (problems if bad else info).append(line)
+
+    dead, line = check_services()
+    if dead:
+        problems.append("止まっている常駐サービス: " + ", ".join(dead))
+    else:
+        info.append(line)
+
+    if problems:
+        text = "PCの状態で気になる点があります\n\n" + "\n".join(f"・{p}" for p in problems)
+        if big:
+            text += "\n\n容量を食っているファイル:\n" + "\n".join(
+                f"  {sz/1024**3:.1f}GB  {os.path.basename(p)}" for sz, p in big)
+        notify(text)
+        print(text)
+        return 0
+
+    if report:
+        today = datetime.now().strftime("%-m月%-d日")
+        print(f"{today}のPCの状態は良好です\n")
+        for i in info:
+            print(f"・{i}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

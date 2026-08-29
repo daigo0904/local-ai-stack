@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+qwc-async — 「やっておきます」とすぐ返し、コーディングは裏で qwc に任せて結果を Discord に送る。
+
+LINE や Discord から作業を頼めるようにするための入り口。
+qwc は1件で数分〜数十分かかるので、エージェントに直接 qwc を叩かせると
+「黙って待たされる」か「途中で見切って失敗扱いにする」かのどちらかになる。
+research-async と同じ形で、すぐ一言返して終わり、実作業は子プロセスに任せる。
+
+送り先が Discord なのは、LINE の無料枠が月200通しかないため。
+コードの変更は行数が多く、LINE に流すには向かない。
+
+    qwc-async "ログの日付をJSTにして" qwc
+    qwc-async qwc "ログの日付をJSTにして"     … 順番はどちらでもよい
+    qwc-async --list                          … 頼める場所の一覧
+
+作業場所は ~/.openclaw/qwc-projects.txt に「名前 = パス」で書く。1行目が既定。
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+
+QWC = os.path.expanduser("~/bin/qwc")
+PROJECTS = os.path.expanduser("~/.openclaw/qwc-projects.txt")
+LOG = os.path.expanduser("~/.openclaw/qwc-async.log")
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。
+
+    ここに直書きしない。この一式を公開したときに、
+    自分を指すID（永久に変えられない）が出てしまうため。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+DISCORD_CHANNEL_ID = env_value("DISCORD_CHANNEL_ID")
+DISCORD_API = "https://discord.com/api/v10/channels/{}/messages"
+
+# 結果の一言だけ LINE にも送る。詳しい中身は Discord にあるので、ここは短く。
+LINE_TO = env_value("LINE_USER_ID")
+
+# qwc が1件に使ってよい時間。これを超えたら諦めて、その旨を送る。
+TIMEOUT_S = 30 * 60
+
+# 一覧がまだ無いときに書き出すひな形。実際の行き先は
+# ~/.openclaw/qwc-projects.txt に書く（そちらが本体で、ここは初回の種）。
+#
+# 自分の仕事のフォルダ名をここに書かない。この一式は公開しているので、
+# 何を作っているかがそのまま出てしまう。
+DEFAULT_PROJECTS = f"""\
+# qwc に作業を頼める場所。「名前 = パス」で1行1件。
+# 一番上が既定（場所を言わずに頼まれたときの行き先）。
+# 名前は LINE から打ちやすい短いものにしておくとよい。
+# パスは絶対パスで書く（~ は展開されない）。
+
+qwc = {os.path.expanduser("~")}/コーディングCLI
+"""
+
+
+def load_projects():
+    if not os.path.exists(PROJECTS):
+        os.makedirs(os.path.dirname(PROJECTS), exist_ok=True)
+        with open(PROJECTS, "w") as f:
+            f.write(DEFAULT_PROJECTS)
+    items = []
+    for line in open(PROJECTS):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, path = line.split("=", 1)
+        items.append((name.strip(), os.path.expanduser(path.strip())))
+    return items
+
+
+def load_token():
+    tok = os.environ.get("DISCORD_BOT_TOKEN")
+    if tok:
+        return tok
+    try:
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line.startswith("DISCORD_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def push_discord(text):
+    """Discord の #agent に送る。送信数の制限は無い。"""
+    token = load_token()
+    if not token:
+        print(text)
+        return
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        DISCORD_API.format(DISCORD_CHANNEL_ID), data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bot {token}",
+                 "User-Agent": "qwc-async (local, 1.0)"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception as e:
+        note(f"Discord に送れませんでした: {e}")
+
+
+def push_line(text):
+    """終わったことだけ LINE に一言。残り枠が少ないときは黙る。
+    朝の便りのほうが優先度が高いので、その枠を食わないようにする。"""
+    quota = os.path.expanduser("~/bin/line-quota")
+    try:
+        if os.path.isfile(quota) and subprocess.run(
+                [quota, "--check", "40"], capture_output=True, timeout=30).returncode != 0:
+            note("LINE の残り枠が少ないので送りませんでした")
+            return
+    except Exception:
+        pass
+    try:
+        subprocess.run(["openclaw", "message", "send", "--channel", "line",
+                        "--target", LINE_TO, "--message", text[:400]],
+                       capture_output=True, timeout=180)
+    except Exception as e:
+        note(f"LINE に送れませんでした: {e}")
+
+
+def note(msg):
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+
+
+def git(path, *args):
+    try:
+        p = subprocess.run(["git", "-C", path, *args],
+                           capture_output=True, text=True, timeout=30)
+        return (p.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def child(task, name, path):
+    """裏で qwc を回し、終わったら「何が変わったか」と一緒に Discord に送る。"""
+    note(f"開始 [{name}] {task}")
+    t0 = time.time()
+    before = git(path, "rev-parse", "HEAD")
+
+    try:
+        p = subprocess.run(
+            [QWC, "-p", task, "--cwd", path, "--yolo", "--quiet-thinking"],
+            capture_output=True, text=True, timeout=TIMEOUT_S,
+        )
+        out = (p.stdout or "").strip() or (p.stderr or "").strip()
+        ok = p.returncode == 0
+    except subprocess.TimeoutExpired:
+        out, ok = f"{TIMEOUT_S // 60}分で終わらなかったので打ち切りました。", False
+    except Exception as e:
+        out, ok = f"qwc を起動できませんでした: {e}", False
+
+    mins = int(time.time() - t0) // 60
+    secs = int(time.time() - t0) % 60
+    elapsed = f"{mins}分{secs}秒" if mins else f"{secs}秒"
+
+    # 「で、何が変わったの」を先に出す。本文より知りたいのはこっち。
+    diff = git(path, "diff", "--stat")
+    after = git(path, "rev-parse", "HEAD")
+    changed = diff if diff else ("（作業ツリーに変更なし）" if before == after else "（コミット済み）")
+
+    head = f"{'✅' if ok else '⚠️'} qwc [{name}] {elapsed}\n> {task}"
+    body = f"\n\n**変わったところ**\n```\n{changed[:600]}\n```\n**qwc の返事**\n{out[-900:]}"
+    push_discord(head + body)
+
+    # LINE には「終わった・何が変わった」だけ。読むのは歩きながらかもしれない。
+    tail = changed.strip().splitlines()[-1].strip() if diff else changed
+    push_line(f"{'✅' if ok else '⚠️'} qwc[{name}] {elapsed}で終わりました。\n"
+              f"「{task[:50]}」\n{tail[:80]}\n詳しい中身は Discord に送りました。")
+    note(f"完了 [{name}] {elapsed} ok={ok}")
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a.strip()]
+    projects = load_projects()
+    names = {n: p for n, p in projects}
+
+    if not args or args[0] in ("--list", "-l"):
+        print("qwc に作業を頼める場所:")
+        for i, (n, p) in enumerate(projects):
+            print(f"  {n}{'（既定）' if i == 0 else ''}  {p}")
+        print('使い方: qwc-async "やってほしいこと" 場所の名前')
+        return 0
+
+    # 名前は前でも後ろでもよい。見つからなければ既定の場所を使う。
+    name = None
+    rest = list(args)
+    for i, a in enumerate(rest):
+        if a in names:
+            name = a
+            rest.pop(i)
+            break
+    if name is None:
+        name = projects[0][0]
+    path = names[name]
+    task = " ".join(rest).strip()
+
+    if not task:
+        print('やってほしいことが空です。例: qwc-async "テストを直して" qwc', file=sys.stderr)
+        return 2
+    if not os.path.isdir(path):
+        print(f"{name} の場所が見つかりません: {path}", file=sys.stderr)
+        return 2
+
+    if os.environ.get("QWC_ASYNC_CHILD") == "1":
+        child(task, name, path)
+        return 0
+
+    # 子プロセスを切り離して起動する。親はすぐ終わるので待たされない。
+    env = dict(os.environ, QWC_ASYNC_CHILD="1")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), task, name],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    print(f"{name} で「{task}」に取りかかります。終わったら LINE と Discord に知らせます（数分〜30分）。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

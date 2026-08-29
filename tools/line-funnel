@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+line-funnel — LINE の入り口を Tailscale Funnel（URLが変わらない）に移す。
+
+なぜ移すか:
+  cloudflared のクイックトンネルは、起動のたびに URL が変わる。
+  そのため「新しいURLを拾って LINE に登録し直す」常駐処理（line-webhook-sync）と、
+  切れたら張り直す処理（line-guard）が要る。この綱渡りが 2026-08-29 に折れて、
+  10:48 から 19:37 までの8時間49分、LINE が丸ごと届かなくなった。
+
+  Funnel の URL はこのMacに固定で紐づく。二度と変わらないので、
+  拾い直しも登録し直しも要らない。ネットが戻れば勝手に元通りになる。
+
+    line-funnel            切り替える（何度実行してもよい）
+    line-funnel --status   今どうなっているか見る
+    line-funnel --revert   cloudflared に戻す
+
+先に済ませておくこと（どちらも1回だけ、人の手が要る）:
+    sudo brew services start tailscale
+    tailscale up
+"""
+
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+PROXY_PORT = 18899
+WEBHOOK_PATH = "/line/webhook"
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+LA = os.path.expanduser("~/Library/LaunchAgents")
+OLD_JOBS = ["ai.openclaw.line-tunnel", "ai.openclaw.line-sync"]
+TS = "/opt/homebrew/bin/tailscale"
+API = "https://api.line.me/v2/bot/channel/webhook"
+
+
+def run(*args, **kw):
+    return subprocess.run(args, capture_output=True, text=True, timeout=120, **kw)
+
+
+def die(msg, hint=""):
+    print(f"✗ {msg}", file=sys.stderr)
+    if hint:
+        print(hint, file=sys.stderr)
+    sys.exit(1)
+
+
+def line_token():
+    tok = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    if tok:
+        return tok
+    try:
+        for line in open(ENV_FILE):
+            if line.strip().startswith("LINE_CHANNEL_ACCESS_TOKEN="):
+                return line.strip().split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def line_api(path="/endpoint", method="GET", body=None, timeout=30):
+    tok = line_token()
+    if not tok:
+        die("LINE_CHANNEL_ACCESS_TOKEN が ~/.openclaw/.env に見つかりません")
+    req = urllib.request.Request(
+        API + path, method=method,
+        data=json.dumps(body).encode() if body else None,
+        headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else {}
+
+
+def ts_state():
+    """tailscaled が動いていてログイン済みか。動いていなければ None。"""
+    p = run(TS, "status", "--json")
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        return None
+
+
+def funnel_url(state):
+    """このMacに固定で紐づく URL。Funnel はここの 443 を外に出す。"""
+    name = (state.get("Self") or {}).get("DNSName", "").rstrip(".")
+    return f"https://{name}" if name else None
+
+
+def ensure_ready():
+    state = ts_state()
+    if state is None:
+        die("tailscaled が動いていません。",
+            "  先にこれを1回だけ実行してください:\n"
+            "    sudo brew services start tailscale")
+    if state.get("BackendState") != "Running":
+        die(f"Tailscale にログインしていません（今の状態: {state.get('BackendState')}）。",
+            "  先にこれを1回だけ実行してください:\n"
+            "    tailscale up")
+    if not funnel_url(state):
+        die("このMacの Tailscale 名が取れませんでした。`tailscale status` を見てください。")
+    return state
+
+
+def disable_old_jobs():
+    """cloudflared と URL 同期を降ろす。plist は捨てずに .disabled で残す。"""
+    uid = os.getuid()
+    for label in OLD_JOBS:
+        run("launchctl", "bootout", f"gui/{uid}/{label}")
+        plist = os.path.join(LA, f"{label}.plist")
+        if os.path.exists(plist):
+            os.replace(plist, plist + ".disabled")
+            print(f"  停止: {label}")
+
+
+def enable_old_jobs():
+    uid = os.getuid()
+    for label in OLD_JOBS:
+        plist = os.path.join(LA, f"{label}.plist")
+        if os.path.exists(plist + ".disabled"):
+            os.replace(plist + ".disabled", plist)
+        if os.path.exists(plist):
+            run("launchctl", "bootstrap", f"gui/{uid}", plist)
+            print(f"  復帰: {label}")
+
+
+def cmd_status():
+    state = ts_state()
+    if state is None:
+        print("Tailscale : 動いていない（sudo brew services start tailscale）")
+    else:
+        print(f"Tailscale : {state.get('BackendState')}")
+        print(f"このMac   : {funnel_url(state) or '(名前なし)'}")
+    p = run(TS, "funnel", "status")
+    print("Funnel    :", (p.stdout or p.stderr).strip().splitlines()[0] if (p.stdout or p.stderr).strip() else "(なし)")
+    try:
+        cur = line_api()
+        print(f"LINE登録  : {cur.get('endpoint')} (有効={cur.get('active')})")
+    except Exception as e:
+        print("LINE登録  : 確認できず:", e)
+    for label in OLD_JOBS:
+        on = os.path.exists(os.path.join(LA, f"{label}.plist"))
+        print(f"{label:26s}: {'動いている' if on else '止めてある'}")
+    return 0
+
+
+def cmd_revert():
+    run(TS, "funnel", "--bg", "off")
+    print("Funnel を止めました。")
+    enable_old_jobs()
+    print("cloudflared に戻しました。URLは line-webhook-sync が数分以内に登録し直します。")
+    return 0
+
+
+def cmd_setup():
+    state = ensure_ready()
+    base = funnel_url(state)
+    print(f"このMacの固定URL: {base}")
+
+    # 1. Funnel を上げる（18899 = line-webhook-proxy の待ち受け）
+    p = run(TS, "funnel", "--bg", str(PROXY_PORT))
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode != 0:
+        die("Funnel を有効にできませんでした。", out)
+    if out:
+        print(out)
+
+    # 2. LINE に1回だけ登録する。ここから先、URLは二度と変わらない。
+    want = base + WEBHOOK_PATH
+    cur = line_api()
+    if cur.get("endpoint") == want:
+        print(f"LINE には既に登録済み: {want}")
+    else:
+        print(f"LINE の登録を書き換えます: {cur.get('endpoint')} → {want}")
+        line_api("/endpoint", "PUT", {"endpoint": want})
+        after = line_api()
+        print(f"  登録しました (有効={after.get('active')})")
+
+    # 3. LINE 自身に叩いてもらって、本当に届くか確かめる
+    t = line_api("/test", "POST", timeout=60)
+    if t.get("success") and t.get("statusCode") == 200:
+        print("LINE から届きました。切り替え成功です。")
+    else:
+        die(f"LINE から届きませんでした: {t}",
+            "  Funnel がまだ広がっていないだけかもしれません。1分ほど置いて\n"
+            "  line-funnel --status を見てください。戻すなら line-funnel --revert")
+
+    # 4. 届くのを確かめてから、古い仕組みを降ろす
+    print("古い仕組みを止めます:")
+    disable_old_jobs()
+    print("\n完了。URLが変わらなくなったので、張り直しも登録し直しも要りません。")
+    return 0
+
+
+def main():
+    if "--status" in sys.argv:
+        return cmd_status()
+    if "--revert" in sys.argv:
+        return cmd_revert()
+    return cmd_setup()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

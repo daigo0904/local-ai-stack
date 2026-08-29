@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+bsky-post — Bluesky に投稿する。
+
+  bsky-post "投稿する文"
+  bsky-post --dry-run "下見だけ"
+  echo "文" | bsky-post -
+
+Bluesky は公式APIが無料で、審査も従量課金も無い。認証は
+~/.openclaw/.env の BSKY_HANDLE と BSKY_APP_PASSWORD を使う
+（アプリパスワードは本体のパスワードとは別物で、いつでも失効させられる）。
+
+リンクとハッシュタグは「facet」という指定を別に付けないと、
+文字が見えているだけで押せないただの文字列になる。ここで自動的に付ける。
+facet の位置は文字数ではなく **UTF-8のバイト数** で数える決まりなので、
+日本語混じりだと文字数で計算すると必ずずれる。
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+PDS = os.environ.get("BSKY_PDS", "https://bsky.social")
+
+MAX_CHARS = 300    # Bluesky の上限（書記素300）
+MAX_BYTES = 3000   # 同じく、バイト数の上限
+
+URL_RE = re.compile(r"https?://[^\s<>\"'）」】]+")
+# 日本語のハッシュタグも拾う。末尾の句読点は含めない。
+TAG_RE = re.compile(r"(?<![\w#])#([^\s#、。,.!?！？]{1,60})")
+
+
+def load_env(name):
+    v = os.environ.get(name)
+    if v:
+        return v
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def api(path, body=None, token=None, timeout=60):
+    url = f"{PDS}/xrpc/{path}"
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"Bluesky が {e.code} を返しました: {detail}") from None
+
+
+def build_facets(text):
+    """リンクとハッシュタグを押せるようにする指定を組み立てる。"""
+    facets = []
+
+    def byte_range(match):
+        # 文字位置ではなくバイト位置に直す
+        start = len(text[:match.start()].encode("utf-8"))
+        end = len(text[:match.end()].encode("utf-8"))
+        return start, end
+
+    for m in URL_RE.finditer(text):
+        uri = m.group(0).rstrip(".,;:)")
+        start, end = byte_range(m)
+        end = start + len(uri.encode("utf-8"))
+        facets.append({
+            "index": {"byteStart": start, "byteEnd": end},
+            "features": [{"$type": "app.bsky.richtext.facet#link", "uri": uri}],
+        })
+
+    for m in TAG_RE.finditer(text):
+        tag = m.group(1)
+        start, end = byte_range(m)
+        facets.append({
+            "index": {"byteStart": start, "byteEnd": end},
+            "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": tag}],
+        })
+
+    return sorted(facets, key=lambda f: f["index"]["byteStart"])
+
+
+def check_length(text):
+    problems = []
+    if len(text) > MAX_CHARS:
+        problems.append(f"{len(text)}文字あります（上限{MAX_CHARS}文字）")
+    if len(text.encode("utf-8")) > MAX_BYTES:
+        problems.append(f"{len(text.encode('utf-8'))}バイトあります（上限{MAX_BYTES}）")
+    return problems
+
+
+def post(text, dry_run=False):
+    text = text.strip()
+    if not text:
+        print("投稿する文がありません。", file=sys.stderr)
+        return 2
+
+    problems = check_length(text)
+    if problems:
+        print("投稿できません: " + " / ".join(problems), file=sys.stderr)
+        return 1
+
+    facets = build_facets(text)
+
+    if dry_run:
+        print("--- 投稿される内容（実際には送っていません）---")
+        print(text)
+        print(f"--- {len(text)}文字 / リンク{sum(1 for f in facets for x in f['features'] if x['$type'].endswith('#link'))}件 "
+              f"/ タグ{sum(1 for f in facets for x in f['features'] if x['$type'].endswith('#tag'))}件 ---")
+        return 0
+
+    handle = load_env("BSKY_HANDLE")
+    password = load_env("BSKY_APP_PASSWORD")
+    if not handle or not password:
+        print("Bluesky の認証情報がありません。~/.openclaw/.env に", file=sys.stderr)
+        print("  BSKY_HANDLE=あなた.bsky.social", file=sys.stderr)
+        print("  BSKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx", file=sys.stderr)
+        print("を書いてください（アプリパスワードは Bluesky の設定画面で作ります）。",
+              file=sys.stderr)
+        return 2
+
+    session = api("com.atproto.server.createSession",
+                  {"identifier": handle, "password": password})
+    record = {
+        "$type": "app.bsky.feed.post",
+        "text": text,
+        "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "langs": ["ja"],
+    }
+    if facets:
+        record["facets"] = facets
+
+    res = api("com.atproto.repo.createRecord", {
+        "repo": session["did"],
+        "collection": "app.bsky.feed.post",
+        "record": record,
+    }, token=session["accessJwt"])
+
+    rkey = (res.get("uri") or "").rsplit("/", 1)[-1]
+    print(f"投稿しました: https://bsky.app/profile/{handle}/post/{rkey}")
+    return 0
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    dry_run = "--dry-run" in args
+    args = [a for a in args if a != "--dry-run"]
+
+    if args and args[0] == "-":
+        text = sys.stdin.read()
+    elif args:
+        text = " ".join(args)
+    else:
+        if sys.stdin.isatty():
+            print('使い方: bsky-post "投稿する文"', file=sys.stderr)
+            return 2
+        text = sys.stdin.read()
+
+    try:
+        return post(text, dry_run=dry_run)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"投稿に失敗しました: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

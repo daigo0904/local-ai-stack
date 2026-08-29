@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""
+weather-line — 今日の天気を短い日本語1〜2行にする。
+
+APIキーの要らない wttr.in を使う。英語で返る天気の説明はこちらで日本語にする。
+朝のブリーフィングの先頭に足す用途。
+
+    weather-line              東京の天気
+    WEATHER_CITY=Osaka weather-line
+"""
+
+import json
+import os
+import sys
+import urllib.request
+
+CITY = os.environ.get("WEATHER_CITY", "Tokyo")
+CITY_JA = os.environ.get("WEATHER_CITY_JA", "東京")
+
+# wttr.in が返す英語の天気表現を日本語にする。部分一致で拾う。
+WORDS = [
+    ("thunder", "雷雨"),
+    ("heavy rain", "強い雨"),
+    ("heavy snow", "大雪"),
+    ("light rain", "小雨"),
+    ("patchy rain", "ところにより雨"),
+    ("patchy snow", "ところにより雪"),
+    ("drizzle", "霧雨"),
+    ("rain", "雨"),
+    ("snow", "雪"),
+    ("sleet", "みぞれ"),
+    ("mist", "霧"),
+    ("fog", "霧"),
+    ("overcast", "曇り"),
+    ("cloudy", "くもり"),
+    ("partly", "晴れときどきくもり"),
+    ("clear", "晴れ"),
+    ("sunny", "晴れ"),
+]
+
+
+def to_ja(desc):
+    low = desc.lower()
+    for en, ja in WORDS:
+        if en in low:
+            return ja
+    return desc  # 分からない表現はそのまま出す（嘘をつかない）
+
+
+def main():
+    url = f"https://wttr.in/{CITY}?format=j1"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.loads(r.read())
+    except Exception:
+        return 0  # 取れなければ黙る。天気でブリーフィング全体を壊さない。
+
+    try:
+        cur = d["current_condition"][0]
+        today = d["weather"][0]
+        desc = to_ja(cur["weatherDesc"][0]["value"])
+        tmax, tmin = today["maxtempC"], today["mintempC"]
+        rain = max(int(h["chanceofrain"]) for h in today["hourly"])
+    except Exception:
+        return 0
+
+    line = f"{CITY_JA}の天気は{desc}、最高{tmax}度・最低{tmin}度。"
+    if rain >= 50:
+        line += f"降水確率{rain}%なので傘があると安心です。"
+    elif rain >= 30:
+        line += f"降水確率{rain}%です。"
+    print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

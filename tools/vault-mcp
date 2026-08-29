@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""
+vault-mcp — OpenClaw に渡す最小限の道具箱（MCPサーバー）。
+
+シェル(exec)を丸ごと渡すと、14Bは
+  - 存在しないコマンド（bun --version など）を試す
+  - 許可されていないコマンドで承認待ちのまま固まる
+  - コマンドを実行せず文章として書いて終わる
+といった失敗をする。そこで、できることを次の3つだけに絞る。
+
+  research(query)        調査を開始する（すぐ返る。結果は後からLINEに届く）
+  list_notes()           保存済みノートの一覧
+  read_note(filename)    ノートを読む
+  sns_post(id)           承認された下書きを Bluesky に投稿する
+  sns_drop(id)           下書きを破棄する
+
+道具は増やしすぎない。提示するだけでプロンプトが膨らみ、小さいモデルほど
+判断がぶれるため。SNS の承認も「番号ひとつ」で済む形に絞ってある。
+
+標準入出力で JSON-RPC を話す。OpenClaw の mcp.servers から起動される。
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+VAULT_INBOX = os.path.expanduser("~/知識メモ/Inbox")
+RESEARCH_ASYNC = os.path.expanduser("~/bin/research-async")
+SNS_APPROVE = os.path.expanduser("~/bin/sns-approve")
+PROTOCOL_VERSION = "2024-11-05"
+
+TOOLS = [
+    {
+        "name": "research",
+        "description": (
+            "調べ物をして Obsidian に保存する。最新情報が必要なとき、"
+            "または後で見返したいときに使う。すぐ返ってくるので待つ必要はない。"
+            "検索・要約・保存は裏で進み、結果は自動でユーザーに届く。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "調べたい内容。日本語でそのまま書く。",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "list_notes",
+        "description": "保存済みのノート一覧を新しい順に返す。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_note",
+        "description": "ノートの中身を読む。ファイル名は list_notes で調べたものを使う。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "list_notes に出てきたファイル名",
+                }
+            },
+            "required": ["filename"],
+        },
+    },
+    {
+        "name": "sns_post",
+        "description": (
+            "SNSの下書きを承認して Bluesky に投稿する。"
+            "ユーザーが「投稿 3」「3番出して」のように番号を挙げて公開を認めたときだけ使う。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "下書きの番号"},
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "sns_drop",
+        "description": (
+            "SNSの下書きを破棄する。"
+            "ユーザーが「やめ 3」「3番いらない」のように断ったときに使う。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "下書きの番号"},
+            },
+            "required": ["id"],
+        },
+    },
+]
+
+
+def tool_research(args):
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "調べたい内容が空です。"
+    try:
+        p = subprocess.run([RESEARCH_ASYNC, query], capture_output=True, text=True, timeout=60)
+        return (p.stdout or p.stderr or "").strip() or f"「{query}」の調査を開始しました。"
+    except Exception as e:
+        return f"調査を開始できませんでした: {e}"
+
+
+def tool_list_notes(_args):
+    try:
+        files = [f for f in os.listdir(VAULT_INBOX) if f.endswith(".md")]
+    except OSError:
+        return "ノートのフォルダが見つかりません。"
+    if not files:
+        return "保存されたノートはまだありません。"
+    files.sort(key=lambda f: os.path.getmtime(os.path.join(VAULT_INBOX, f)), reverse=True)
+    lines = [f"ノートは全部で{len(files)}件です。新しい順に最大20件:"]
+    lines += [f"- {f}" for f in files[:20]]
+    return "\n".join(lines)
+
+
+def tool_read_note(args):
+    name = os.path.basename((args.get("filename") or "").strip())
+    if not name:
+        return "ファイル名が空です。"
+    if not name.endswith(".md"):
+        name += ".md"
+    path = os.path.join(VAULT_INBOX, name)
+    if not os.path.isfile(path):
+        return f"{name} は見つかりません。list_notes で名前を確認してください。"
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()[:8000]
+    except OSError as e:
+        return f"読めませんでした: {e}"
+
+
+def _sns(args, extra=None):
+    """sns-approve に番号を渡すだけ。投稿の判断はユーザーがすでに済ませている。"""
+    raw = args.get("id")
+    try:
+        item_id = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return "何番の下書きか分かりませんでした。番号を教えてください。"
+    cmd = [SNS_APPROVE, str(item_id)] + (extra or [])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return (p.stdout or p.stderr or "").strip() or "処理しました。"
+    except Exception as e:
+        return f"うまくいきませんでした: {e}"
+
+
+def tool_sns_post(args):
+    return _sns(args)
+
+
+def tool_sns_drop(args):
+    return _sns(args, ["--drop"])
+
+
+HANDLERS = {
+    "research": tool_research,
+    "list_notes": tool_list_notes,
+    "read_note": tool_read_note,
+    "sns_post": tool_sns_post,
+    "sns_drop": tool_sns_drop,
+}
+
+
+def respond(msg_id, result=None, error=None):
+    out = {"jsonrpc": "2.0", "id": msg_id}
+    if error is not None:
+        out["error"] = error
+    else:
+        out["result"] = result
+    sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        method = msg.get("method")
+        msg_id = msg.get("id")
+
+        if method == "initialize":
+            respond(msg_id, {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "vault-mcp", "version": "1.0.0"},
+            })
+        elif method == "tools/list":
+            respond(msg_id, {"tools": TOOLS})
+        elif method == "tools/call":
+            params = msg.get("params") or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            fn = HANDLERS.get(name)
+            if not fn:
+                respond(msg_id, error={"code": -32601, "message": f"unknown tool: {name}"})
+                continue
+            try:
+                text = fn(args)
+            except Exception as e:
+                text = f"実行に失敗しました: {e}"
+            respond(msg_id, {"content": [{"type": "text", "text": text}]})
+        elif method in ("notifications/initialized", "initialized"):
+            pass  # 通知には返事をしない
+        elif method == "ping":
+            respond(msg_id, {})
+        elif msg_id is not None:
+            respond(msg_id, error={"code": -32601, "message": f"unknown method: {method}"})
+
+
+if __name__ == "__main__":
+    main()

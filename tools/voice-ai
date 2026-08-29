@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""
+voice-ai — 声で話しかけて、声で返してもらう。全部このPCの中で完結する。
+
+  マイク(sox) → 文字起こし(whisper.cpp) → 判断(qwen3:14b) → 読み上げ(say)
+
+外部サービスを一切使わないので、話した内容がどこにも送られない。
+（ただし「調べて」と頼んだときだけ、検索のため Tavily に検索語が飛ぶ）
+
+    voice-ai              Option(⌥)キーを押している間だけ聞く。押し離しで何度でも
+    voice-ai --once       同じだが、1往復したら終わる
+    voice-ai --timed      昔ながらの方式。決まった秒数だけ聞いて答える
+    voice-ai --loop       決まった秒数で聞くのを繰り返す（「終わり」と言うと止まる）
+    voice-ai --text "…"   マイクを使わず文字で試す
+    voice-ai --seconds 8  録音の長さを変える（既定6秒、--timed と --loop 用）
+    voice-ai --no-discord Discord に会話を残さない
+
+話した内容と返事は Discord の #agent に残る。声は流れて消えるため。
+
+Option キーを使う方式なら、話し終わるまで待ってくれるし、
+黙っている間はマイクが動かないのでテレビや周りの話し声を拾わない。
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+def pick_whisper_model():
+    """使える中でいちばん精度の高いモデルを選ぶ。turbo があればそれを使う。"""
+    env = os.environ.get("WHISPER_MODEL")
+    if env:
+        return os.path.expanduser(env)
+    base = os.path.expanduser("~/AIモデル/whisper")
+    for name in ("ggml-large-v3-turbo-q5_0.bin", "ggml-medium.bin", "ggml-small.bin"):
+        path = os.path.join(base, name)
+        if os.path.isfile(path):
+            return path
+    return os.path.join(base, "ggml-small.bin")
+
+
+WHISPER_MODEL = pick_whisper_model()
+OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434") + "/api/chat"
+MODEL = os.environ.get("VOICE_MODEL", "qwen3:14b-q4_K_M")
+VOICE = os.environ.get("VOICE_NAME", "Kyoko")
+RESEARCH_ASYNC = os.path.expanduser("~/bin/research-async")
+OPTKEY = os.path.expanduser("~/bin/optkey")
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。
+
+    ここに直書きしない。この一式を公開したときに、
+    自分を指すID（永久に変えられない）が出てしまうため。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+DISCORD_CHANNEL_ID = env_value("DISCORD_CHANNEL_ID")
+SECONDS = 6
+MAX_HOLD_SECONDS = 120  # 押しっぱなしを忘れても録音が無限に伸びないように
+NO_DISCORD = "--no-discord" in sys.argv or os.environ.get("VOICE_DISCORD") == "0"
+
+# 声で答えるときは短くないと聞いていられない
+SYSTEM = """あなたは声で応答するアシスタントです。相手は音声で聞いています。
+
+守ること:
+- 返事は2文以内。長い説明はしない。箇条書きも使わない。
+- 記号や絵文字を使わない。読み上げると雑音になる。
+- 数字は聞き取りやすく書く（例: 25度、3件）。
+- 知らないことは「分かりません」と正直に言う。
+
+相手が最新の情報を知りたそうなとき（値段、最新版、今日のニュース、バージョン番号など）は、
+次の2行だけを返してください。
+
+調べてきます。
+SEARCH: 調べる内容
+
+**このとき答えを書いてはいけません。** あなたの知識は古く、間違っていることがあります。
+「3.11です」のようにバージョン番号や日付を書くと嘘になります。
+本当の答えは裏で調べて後からDiscordに届くので、あなたは調べる合図だけ出してください。
+
+SEARCH: の行は読み上げられません。
+"""
+
+
+def speak(text):
+    if not text:
+        return
+    # 読み上げに邪魔な記号を落とす
+    clean = re.sub(r"[*_`#\[\]()<>|]", "", text)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if not clean:
+        return
+    try:
+        subprocess.run(["say", "-v", VOICE, clean], timeout=180)
+    except Exception:
+        try:
+            subprocess.run(["say", clean], timeout=180)
+        except Exception:
+            pass
+
+
+def peak_amplitude(path):
+    """録音の最大振幅（0〜1）を返す。読み取れなければ 0。"""
+    try:
+        p = subprocess.run(["sox", path, "-n", "stat"],
+                           capture_output=True, text=True, timeout=60)
+        m = re.search(r"Maximum amplitude:\s*([0-9.]+)", p.stderr or "")
+        return float(m.group(1)) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+def load_env(name):
+    v = os.environ.get(name)
+    if v:
+        return v
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def push_discord(text):
+    """話した内容と返事を Discord に残す。
+
+    声は流れて消えるので、後から読み返せる場所が要る。
+    LINE ではなく Discord なのは、LINE の無料枠が月200通しかないため。
+    失敗しても会話は止めない。"""
+    token = load_env("DISCORD_BOT_TOKEN")
+    if not token:
+        return
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+        data=body, headers={"Content-Type": "application/json",
+                            "Authorization": f"Bot {token}",
+                            "User-Agent": "voice-ai (local, 1.0)"})
+    try:
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception:
+        pass
+
+
+def beep(name):
+    """短い音で状態を知らせる。画面を見ていなくても動きが分かるように。
+
+    押している間だけ録音する方式では、画面に何も出ないと
+    「動いていない」のか「待っている」のか区別が付かない。"""
+    path = f"/System/Library/Sounds/{name}.aiff"
+    if not os.path.isfile(path):
+        return
+    try:
+        subprocess.Popen(["afplay", path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def mic_help():
+    print("  システム設定 > プライバシーとセキュリティ > マイク で、"
+          "ターミナルに許可を与えてください。", file=sys.stderr)
+
+
+def to_whisper_wav(raw_path):
+    """録音した wav を whisper が扱える 16kHz モノラルにして返す。
+
+    内蔵マイクは 16kHz を受け付けないことがあるので、録音は端末任せにして
+    あとからここで変換する。
+
+    このMacの内蔵マイクは録音レベルがとても低く（実測で最大振幅 0.03、
+    人の声なら 0.3 は欲しい）、そのままでは whisper が言葉を取り違える。
+    そこで音量を正規化してから渡す。ただし無音まで持ち上げると
+    環境音を言葉と誤認するので、声が入っているときだけ正規化する。"""
+    out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    out.close()
+    chain = ["sox", raw_path, "-r", "16000", "-c", "1", "-b", "16", out.name,
+             "highpass", "80"]
+    if peak_amplitude(raw_path) >= 0.005:
+        chain += ["norm", "-1"]
+    try:
+        subprocess.run(chain, capture_output=True, timeout=120)
+    except Exception as e:
+        print(f"音声の変換に失敗しました: {e}", file=sys.stderr)
+        return None
+    return out.name if os.path.exists(out.name) and os.path.getsize(out.name) > 1000 else None
+
+
+def record(seconds):
+    """決めた秒数だけ録音する。"""
+    raw = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    raw.close()
+    try:
+        p = subprocess.run(
+            ["rec", "-q", "-c", "1", raw.name, "trim", "0", str(seconds)],
+            capture_output=True, text=True, timeout=seconds + 60,
+        )
+        if p.returncode != 0 or os.path.getsize(raw.name) < 1000:
+            err = (p.stderr or "").strip()[:200]
+            print("マイクから録音できませんでした。", file=sys.stderr)
+            if err:
+                print(f"  {err}", file=sys.stderr)
+            mic_help()
+            return None
+        return to_whisper_wav(raw.name)
+    except FileNotFoundError:
+        print("録音コマンド(rec)が見つかりません。brew install sox が必要です。", file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print("録音が終わりませんでした。マイクの許可を確認してください。", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"録音に失敗しました: {e}", file=sys.stderr)
+        return None
+    finally:
+        try:
+            os.unlink(raw.name)
+        except OSError:
+            pass
+
+
+def record_while_held():
+    """Option(⌥)キーを押している間だけ録音する。
+
+    押されるまではマイクを開かないので、黙っている間に周りの音を拾わない。
+    離した瞬間に sox へ Ctrl+C 相当の合図を送る。sox はこれを受けると
+    ファイルを正しく閉じてから終わるので、途中で切っても壊れない。
+
+    戻り値は wav のパス、`None` は録音できなかったとき、
+    `""` は押した時間が短すぎて中身が無かったとき。"""
+    if not os.path.isfile(OPTKEY):
+        print("Optionキーを見る道具(~/bin/optkey)がありません。", file=sys.stderr)
+        print("  swiftc -O ~/bin/src/optkey.swift -o ~/bin/optkey で作り直せます。",
+              file=sys.stderr)
+        return None
+
+    print("Option(⌥)キーを押しながら話してください。離すと考え始めます。"
+          "（やめるときは Control+C）")
+    beep("Morse")  # 待ち受けに入った合図
+    # 待ち時間に上限を付けておく。voice-ai が不意に落ちても、
+    # 待ち役の optkey がいつまでも残り続けないようにするため。
+    waited = subprocess.run([OPTKEY, "wait-down", "3600"])
+    if waited.returncode == 2:
+        return ""  # 1時間押されなかっただけなので、声をかけ直す
+    if waited.returncode != 0:
+        print(f"Optionキーを見られませんでした（終了コード {waited.returncode}）。",
+              file=sys.stderr)
+        return None
+
+    raw = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    raw.close()
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ["rec", "-q", "-c", "1", raw.name, "trim", "0", str(MAX_HOLD_SECONDS)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        print("  ● 録音中…")
+        beep("Tink")   # 録音が始まった合図
+        # 押しっぱなしを忘れたときのために、上限を超えたら勝手に切り上げる
+        subprocess.run([OPTKEY, "wait-up", str(MAX_HOLD_SECONDS)])
+        beep("Pop")    # 録音が終わって考え始める合図
+    except FileNotFoundError:
+        print("録音コマンド(rec)が見つかりません。brew install sox が必要です。", file=sys.stderr)
+        return None
+    except KeyboardInterrupt:
+        if proc and proc.poll() is None:
+            proc.kill()
+        raise
+    finally:
+        if proc and proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    try:
+        if proc.returncode not in (0, None) or os.path.getsize(raw.name) < 1000:
+            err = (proc.stderr.read() or "").strip()[:200] if proc.stderr else ""
+            if err:
+                print("マイクから録音できませんでした。", file=sys.stderr)
+                print(f"  {err}", file=sys.stderr)
+                mic_help()
+                return None
+            print("押している時間が短すぎました。もう少し長めに押してください。")
+            return ""
+        return to_whisper_wav(raw.name)
+    finally:
+        try:
+            os.unlink(raw.name)
+        except OSError:
+            pass
+
+
+def transcribe(wav):
+    if not os.path.isfile(WHISPER_MODEL):
+        print(f"音声認識モデルがありません: {WHISPER_MODEL}", file=sys.stderr)
+        return ""
+    try:
+        p = subprocess.run(
+            ["whisper-cli", "-m", WHISPER_MODEL, "-l", "ja", "-nt", "-sns", "-f", wav],
+            capture_output=True, text=True, timeout=300,
+        )
+        text = (p.stdout or "").strip()
+    except Exception as e:
+        print(f"文字起こしに失敗しました: {e}", file=sys.stderr)
+        return ""
+    # whisper が付ける [BLANK_AUDIO] などを落とす
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    # large-v3 系は聞き取りにくい音に「大将:」のような話者ラベルを勝手に付ける。
+    # 実在しない発言なので落とす（短い見出しだけを対象にして本文は守る）
+    text = re.sub(r"(^|\s)[^\s:：]{1,8}[:：]\s*", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def ask(history):
+    body = json.dumps({
+        "model": MODEL, "stream": False, "think": False, "keep_alive": "30m",
+        "options": {"num_ctx": 8192, "temperature": 0.4, "top_p": 0.9},
+        "messages": [{"role": "system", "content": SYSTEM}] + history,
+    }).encode()
+    try:
+        req = urllib.request.Request(OLLAMA, data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=300) as r:
+            d = json.loads(r.read())
+        return (d.get("message", {}).get("content") or "").strip()
+    except Exception as e:
+        return f"うまく考えられませんでした。{e}"
+
+
+def split_search(reply):
+    """返事から SEARCH: 行を抜き出す。読み上げるのは残りだけ。"""
+    queries = re.findall(r"^\s*SEARCH:\s*(.+)$", reply, re.M)
+    spoken = re.sub(r"^\s*SEARCH:.*$", "", reply, flags=re.M).strip()
+    return spoken, [q.strip() for q in queries if q.strip()]
+
+
+def start_research(query):
+    if not os.path.isfile(RESEARCH_ASYNC):
+        return
+    try:
+        subprocess.run([RESEARCH_ASYNC, query], capture_output=True, timeout=60)
+    except Exception:
+        pass
+
+
+def one_turn(history, text=None, seconds=SECONDS, quiet=False, hold=False):
+    if text is None:
+        if hold:
+            wav = record_while_held()
+            if wav == "":  # 押し方が短かっただけなので、やめずにもう一度待つ
+                return ""
+        else:
+            if not quiet:
+                print(f"（{seconds}秒間、話してください…）")
+            wav = record(seconds)
+        if not wav:
+            return None
+        text = transcribe(wav)
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+
+    if not text:
+        speak("聞き取れませんでした。もう一度お願いします。")
+        return ""
+
+    print(f"あなた: {text}")
+
+    if re.search(r"(終わり|おわり|終了|バイバイ|またね|ストップ)", text):
+        speak("わかりました。また呼んでください。")
+        return None
+
+    history.append({"role": "user", "content": text})
+    reply = ask(history)
+    history.append({"role": "assistant", "content": reply})
+
+    spoken, queries = split_search(reply)
+    print(f"AI: {spoken}")
+
+    # 声は消えるので、話した内容と返事を Discord に残す。
+    # 読み上げる前に送るので、長い返事でも記録は先に残る。
+    if not NO_DISCORD:
+        log = f"🎙 **あなた**: {text}\n**AI**: {spoken or 'はい。'}"
+        if queries:
+            log += "\n（調査中: " + " / ".join(queries) + "）"
+        push_discord(log)
+
+    for q in queries:
+        print(f"  （裏で調査: {q}）")
+        start_research(q)
+    if queries and spoken:
+        spoken += " 詳しい結果は後でディスコードに送ります。"
+    speak(spoken or "はい。")
+    return text
+
+
+def main():
+    # ログに落として様子を見るときも、表示がその場で出るようにしておく
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    seconds = SECONDS
+    if "--seconds" in sys.argv:
+        i = sys.argv.index("--seconds")
+        if len(sys.argv) > i + 1:
+            try:
+                seconds = max(2, int(sys.argv[i + 1]))
+            except ValueError:
+                pass
+
+    text = None
+    if "--text" in sys.argv:
+        i = sys.argv.index("--text")
+        if len(sys.argv) > i + 1:
+            text = sys.argv[i + 1]
+
+    history = []
+
+    def trim(h):
+        # 会話が長くなりすぎないよう直近だけ残す
+        if len(h) > 8:
+            del h[:-8]
+
+    if "--loop" in sys.argv:
+        speak("はい、聞いています。")
+        while True:
+            r = one_turn(history, seconds=seconds)
+            if r is None:
+                break
+            trim(history)
+        return 0
+
+    # 何も指定がなければ Option キー方式。押し離しで何度でも話せる
+    if text is None and "--timed" not in sys.argv:
+        once = "--once" in sys.argv
+        try:
+            while True:
+                r = one_turn(history, hold=True)
+                if r is None:
+                    break
+                if once and r != "":
+                    break
+                trim(history)
+        except KeyboardInterrupt:
+            print()
+        return 0
+
+    one_turn(history, text=text, seconds=seconds)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""
+line-webhook-sync — cloudflared のトンネルURLを監視し、変わったら LINE 側に自動登録する。
+
+cloudflared のクイックトンネルは起動のたびにURLが変わる。放置すると LINE からの
+メッセージが届かなくなるので、このスクリプトが常駐して差分を検知し、
+LINE Messaging API の Webhook エンドポイントを更新する。
+
+    line-webhook-sync           # 常駐して60秒ごとに確認
+    line-webhook-sync --once    # 1回だけ確認して終了
+    line-webhook-sync --show    # 現在の状態を表示するだけ
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+LOG = os.environ.get("CLOUDFLARED_LOG", "/tmp/cloudflared-line.log")
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+STATE = os.path.expanduser("~/.openclaw/line-webhook-url.txt")
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/line/webhook")
+INTERVAL = int(os.environ.get("SYNC_INTERVAL", "60"))
+API = "https://api.line.me/v2/bot/channel/webhook/endpoint"
+
+URL_RE = re.compile(r"https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com")
+
+
+def log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def load_token():
+    tok = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    if tok:
+        return tok
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("LINE_CHANNEL_ACCESS_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def current_tunnel_url():
+    """cloudflared のログから最後に出てきたURLを拾う。"""
+    try:
+        with open(LOG, errors="replace") as f:
+            found = URL_RE.findall(f.read())
+        return found[-1] if found else None
+    except OSError:
+        return None
+
+
+def api_call(token, method, body=None):
+    req = urllib.request.Request(
+        API,
+        data=json.dumps(body).encode() if body else None,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else {}
+
+
+def sync_once(token, verbose=True):
+    url = current_tunnel_url()
+    if not url:
+        if verbose:
+            log("トンネルURLがまだ見つからない（cloudflared 起動待ち）")
+        return False
+
+    want = url + WEBHOOK_PATH
+    try:
+        cur = api_call(token, "GET")
+    except Exception as e:
+        log(f"LINE の状態取得に失敗: {e}")
+        return False
+
+    if cur.get("endpoint") == want:
+        if verbose:
+            log(f"変更なし（active={cur.get('active')}）: {want}")
+        return True
+
+    log(f"URL変更を検知: {cur.get('endpoint')} -> {want}")
+    try:
+        api_call(token, "PUT", {"endpoint": want})
+    except urllib.error.HTTPError as e:
+        log(f"更新に失敗（HTTP {e.code}）: {e.read()[:200]}")
+        return False
+    except Exception as e:
+        log(f"更新に失敗: {e}")
+        return False
+
+    try:
+        after = api_call(token, "GET")
+        log(f"更新しました: {after.get('endpoint')} (active={after.get('active')})")
+        with open(STATE, "w") as f:
+            f.write(want + "\n")
+    except Exception:
+        pass
+    return True
+
+
+def show(token):
+    print("トンネルURL:", current_tunnel_url() or "(見つからない)")
+    try:
+        cur = api_call(token, "GET")
+        print("LINE登録URL:", cur.get("endpoint"))
+        print("Webhook有効:", cur.get("active"))
+    except Exception as e:
+        print("LINEへの問い合わせ失敗:", e)
+
+
+def main():
+    token = load_token()
+    if not token:
+        log("LINE_CHANNEL_ACCESS_TOKEN が見つかりません")
+        return 1
+
+    if "--show" in sys.argv:
+        show(token)
+        return 0
+    if "--once" in sys.argv:
+        return 0 if sync_once(token) else 1
+
+    log(f"監視開始（{INTERVAL}秒ごと）")
+    last_ok = None
+    while True:
+        try:
+            url = current_tunnel_url()
+            # URLが前回と同じならAPIを叩かない。無駄な問い合わせを避ける。
+            if url and url == last_ok:
+                time.sleep(INTERVAL)
+                continue
+            if sync_once(token, verbose=(last_ok is None)):
+                last_ok = url
+        except Exception as e:
+            log(f"想定外のエラー: {e}")
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

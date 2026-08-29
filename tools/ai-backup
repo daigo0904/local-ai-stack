@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""
+ai-backup — この AI 環境を丸ごとバックアップする。
+
+守る対象:
+  1. OpenClaw の設定・認証情報・会話履歴（openclaw backup create）
+  2. Obsidian vault（調べて溜めたノート）
+  3. 自作スクリプト（~/bin の research-* など）とブリーフィング設定
+
+    ai-backup              バックアップを取る
+    ai-backup --list       取ってあるバックアップを一覧
+    ai-backup --prune      古いものを消す（既定で30日より前）
+
+保存先は ~/バックアップ。古いものは自動で間引く。
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser("~")
+DEST = os.path.join(HOME, "バックアップ")
+KEEP_DAYS = 30
+
+# まとめて固める対象（存在しないものは黙って飛ばす）
+TARGETS = [
+    ("obsidian", os.path.join(HOME, "知識メモ")),
+    ("scripts", os.path.join(HOME, "bin")),
+]
+EXTRA_FILES = [
+    os.path.join(HOME, ".openclaw", "briefing-topics.txt"),
+    os.path.join(HOME, ".openclaw", "openclaw.json"),
+]
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def openclaw_backup(_stamp):
+    """OpenClaw 本体のバックアップ。認証情報を含むので中身は触らない。
+    --output に保存先ディレクトリを渡す。省略するとカレントに作られて散らばる。"""
+    before = set(os.listdir(DEST)) if os.path.isdir(DEST) else set()
+    try:
+        p = subprocess.run(
+            ["openclaw", "backup", "create", "--output", DEST, "--verify"],
+            capture_output=True, text=True, timeout=900,
+        )
+        if p.returncode != 0:
+            log(f"  OpenClaw のバックアップに失敗: {(p.stderr or p.stdout or '').strip()[:200]}")
+            return None
+    except FileNotFoundError:
+        log("  openclaw コマンドが見つかりません")
+        return None
+    except Exception as e:
+        log(f"  OpenClaw のバックアップに失敗: {e}")
+        return None
+
+    added = [f for f in os.listdir(DEST) if f not in before]
+    return os.path.join(DEST, added[0]) if added else "(作成済み)"
+
+
+def make_archive(stamp):
+    """Obsidian と自作スクリプトを1つの tar.gz にまとめる。"""
+    path = os.path.join(DEST, f"ai-env-{stamp}.tar.gz")
+    n = 0
+    with tarfile.open(path, "w:gz") as tar:
+        for name, src in TARGETS:
+            if not os.path.exists(src):
+                continue
+            # .git や巨大な中間物は入れない
+            def filt(ti, _src=src):
+                base = os.path.basename(ti.name)
+                if base in (".git", "node_modules", "__pycache__", ".DS_Store"):
+                    return None
+                return ti
+            tar.add(src, arcname=name, filter=filt)
+            n += 1
+        for f in EXTRA_FILES:
+            if os.path.exists(f):
+                tar.add(f, arcname=os.path.join("config", os.path.basename(f)))
+                n += 1
+    return path, n
+
+
+def prune():
+    if not os.path.isdir(DEST):
+        return
+    cutoff = datetime.now() - timedelta(days=KEEP_DAYS)
+    removed = 0
+    for name in os.listdir(DEST):
+        p = os.path.join(DEST, name)
+        if not os.path.isfile(p):
+            continue
+        if datetime.fromtimestamp(os.path.getmtime(p)) < cutoff:
+            try:
+                os.remove(p)
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        log(f"{KEEP_DAYS}日より古いバックアップ {removed} 件を削除しました。")
+
+
+def listing():
+    if not os.path.isdir(DEST):
+        log("バックアップはまだありません。")
+        return
+    files = sorted(
+        (f for f in os.listdir(DEST) if os.path.isfile(os.path.join(DEST, f))),
+        key=lambda f: os.path.getmtime(os.path.join(DEST, f)),
+        reverse=True,
+    )
+    if not files:
+        log("バックアップはまだありません。")
+        return
+    total = 0
+    log(f"保存先: {DEST}")
+    for f in files:
+        p = os.path.join(DEST, f)
+        sz = os.path.getsize(p)
+        total += sz
+        when = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
+        log(f"  {when}  {sz/1024/1024:6.1f}MB  {f}")
+    log(f"合計 {len(files)} 件 / {total/1024/1024:.1f}MB")
+
+
+def main():
+    if "--list" in sys.argv:
+        listing()
+        return 0
+    if "--prune" in sys.argv:
+        prune()
+        return 0
+
+    os.makedirs(DEST, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+
+    log("OpenClaw の設定と履歴を保存中…")
+    oc = openclaw_backup(stamp)
+    if oc:
+        log(f"  → {oc}")
+
+    log("Obsidian とスクリプトを保存中…")
+    path, n = make_archive(stamp)
+    sz = os.path.getsize(path) / 1024 / 1024
+    log(f"  → {path} ({sz:.1f}MB, {n}件)")
+
+    prune()
+    log("完了しました。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

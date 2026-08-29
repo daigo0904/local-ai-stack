@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""line-quota — LINE の今月の残り送信数を返す。
+
+    line-quota           残数を表示
+    line-quota --check N 残数が N 未満なら終了コード1（=送るのをやめる合図）
+"""
+import json, os, sys, urllib.request
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+def token():
+    t = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    if t: return t
+    try:
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line.startswith("LINE_CHANNEL_ACCESS_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+def get(url, tok):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+def main():
+    tok = token()
+    if not tok:
+        print("トークンが見つかりません", file=sys.stderr); return 2
+    try:
+        limit = get("https://api.line.me/v2/bot/message/quota", tok).get("value") or 0
+        used = get("https://api.line.me/v2/bot/message/quota/consumption", tok).get("totalUsage") or 0
+    except Exception as e:
+        print(f"取得失敗: {e}", file=sys.stderr)
+        return 0  # 取得できないときは止めない（送信を優先）
+    remain = limit - used
+    if "--check" in sys.argv:
+        i = sys.argv.index("--check")
+        need = int(sys.argv[i+1]) if len(sys.argv) > i+1 else 50
+        if remain < need:
+            print(f"残り{remain}通のため送信を見送ります（下限{need}）", file=sys.stderr)
+            return 1
+        return 0
+    print(f"今月 {used}/{limit} 通使用、残り {remain} 通")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

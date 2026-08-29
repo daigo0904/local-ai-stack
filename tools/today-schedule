@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""
+today-schedule — 今日の予定とやることを短くまとめる。
+
+macOS のカレンダーとリマインダーから読む。Google カレンダーを Mac に
+同期していれば、それもそのまま読める（OAuth の設定は要らない）。
+
+朝のブリーフィングの先頭近くに入れる用途。予定が無ければ何も出さない。
+
+    today-schedule            今日の予定
+    today-schedule --days 2   明日の分まで
+"""
+
+import re
+import subprocess
+import sys
+
+# 予定として知らせても意味が薄いもの（祝日カレンダーなど）
+SKIP_CALENDARS = ("日本の祝日", "Siriからの提案", "誕生日")
+
+
+def run_osa(script, timeout=180):
+    try:
+        p = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            return ""
+        return p.stdout.strip()
+    except Exception:
+        return ""
+
+
+def events(days=1):
+    """今日（--days 2 なら明日まで）の予定を集める。"""
+    # 注意: AppleScript では st が予約語と衝突して構文エラーになる。
+    # 変数名は sdate のように紛れないものを使う。
+    script = f'''
+set d0 to (current date)
+set d0 to d0 - (time of d0)
+set d1 to d0 + ({days} * days)
+set out to ""
+tell application "Calendar"
+repeat with c in calendars
+set cn to name of c
+try
+set evs to (every event of c whose start date ≥ d0 and start date < d1)
+repeat with e in evs
+set sdate to start date of e
+set isAll to allday event of e
+set hh to (hours of sdate) as string
+set mm to text -2 thru -1 of ("0" & ((minutes of sdate) as string))
+set out to out & cn & tab & (summary of e) & tab & hh & ":" & mm & tab & (isAll as string) & linefeed
+end repeat
+end try
+end repeat
+end tell
+return out
+'''
+    out = run_osa(script)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        cal, title, hm, allday = parts[0], parts[1], parts[2], parts[3]
+        if any(s in cal for s in SKIP_CALENDARS):
+            continue
+        if not title.strip():
+            continue
+        rows.append({"cal": cal, "title": title.strip(),
+                     "time": hm, "allday": allday.lower() == "true"})
+    # 同じ予定が複数のカレンダーに入っていることがある（Googleを2アカウント同期など）。
+    # 題名と時刻が同じものは1件にまとめる。
+    seen = set()
+    uniq = []
+    for r in rows:
+        k = (r["title"], r["time"], r["allday"])
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(r)
+
+    # 時刻順に並べる（終日は先頭）
+    def key(r):
+        if r["allday"]:
+            return (0, 0)
+        m = re.match(r"^(\d+):(\d+)$", r["time"])
+        return (1, int(m.group(1)) * 60 + int(m.group(2))) if m else (1, 9999)
+    uniq.sort(key=key)
+    return uniq
+
+
+def reminders():
+    """期限が今日以前で未完了のものだけ。"""
+    script = '''
+set d1 to (current date)
+set d1 to d1 - (time of d1) + (1 * days)
+set out to ""
+tell application "Reminders"
+  repeat with l in lists
+    try
+      set rs to (every reminder of l whose completed is false and due date < d1)
+      repeat with r in rs
+        set out to out & (name of r) & linefeed
+      end repeat
+    end try
+  end repeat
+end tell
+return out
+'''
+    out = run_osa(script)
+    return [l.strip() for l in out.splitlines() if l.strip()][:5]
+
+
+def main():
+    days = 1
+    if "--days" in sys.argv:
+        i = sys.argv.index("--days")
+        if len(sys.argv) > i + 1:
+            try:
+                days = max(1, int(sys.argv[i + 1]))
+            except ValueError:
+                pass
+
+    evs = events(days)
+    rems = reminders()
+
+    if not evs and not rems:
+        return 0  # 何も無ければ黙る
+
+    if evs:
+        print("今日の予定")
+        for e in evs[:8]:
+            when = "終日" if e["allday"] else e["time"]
+            print(f"  {when}  {e['title']}")
+        if len(evs) > 8:
+            print(f"  ほか{len(evs)-8}件")
+
+    if rems:
+        if evs:
+            print()
+        print("期限が来ているやること")
+        for r in rems:
+            print(f"  ・{r}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

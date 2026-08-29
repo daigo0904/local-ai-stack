@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+watch-pages — 指定したページを定期的に見に行き、変化があったら Discord に知らせる。
+
+「競合サイトの価格を監視」「予約サイトの空きを監視」といった用途。
+まず素の HTTP で取りに行き、JavaScript で中身が作られるページだけ
+Chromium（OpenClaw 同梱の playwright-core）で描画してから比べる。
+
+監視対象は ~/.openclaw/watch-pages.txt に1行1件で書く。
+
+    URL                      ページ全体を見る
+    URL | CSSセレクタ         その部分だけ見る（おすすめ。広告等の誤検知を防げる）
+    URL | CSSセレクタ | 名前   通知に使う名前を付ける
+
+    watch-pages           変化を確認して、あれば通知
+    watch-pages --list    監視対象の一覧
+    watch-pages --reset   記録を消して次回を初回扱いにする
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime
+
+CONF = os.path.expanduser("~/.openclaw/watch-pages.txt")
+STATE = os.path.expanduser("~/.openclaw/watch-pages-state.json")
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。
+
+    ここに直書きしない。この一式を公開したときに、
+    自分を指すID（永久に変えられない）が出てしまうため。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+DISCORD_CHANNEL_ID = env_value("DISCORD_CHANNEL_ID")
+OPENCLAW_NM = "/opt/homebrew/lib/node_modules/openclaw/node_modules"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+
+
+def load_token():
+    t = os.environ.get("DISCORD_BOT_TOKEN")
+    if t:
+        return t
+    try:
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line.startswith("DISCORD_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def notify(text):
+    tok = load_token()
+    if not tok:
+        print(text)
+        return
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bot {tok}",
+                 "User-Agent": "watch-pages (local, 1.0)"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception as e:
+        print(f"通知できませんでした: {e}", file=sys.stderr)
+
+
+def load_conf():
+    items = []
+    try:
+        lines = open(CONF, encoding="utf-8").read().splitlines()
+    except OSError:
+        return items
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        url = parts[0]
+        sel = parts[1] if len(parts) > 1 and parts[1] else None
+        name = parts[2] if len(parts) > 2 and parts[2] else url
+        items.append({"url": url, "selector": sel, "name": name})
+    return items
+
+
+def strip_html(html):
+    html = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html)
+    html = re.sub(r"(?s)<!--.*?-->", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    text = (text.replace("&nbsp;", " ").replace("&amp;", "&")
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"'))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fetch_plain(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept-Language": "ja,en;q=0.8"})
+    with urllib.request.urlopen(req, timeout=45) as r:
+        raw = r.read()
+    for enc in ("utf-8", "shift_jis", "euc-jp"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def fetch_rendered(url, selector):
+    """JavaScript で作られるページ用。OpenClaw 同梱の Chromium で描画する。"""
+    script = """
+const {chromium} = require(process.argv[2] + '/playwright-core');
+(async () => {
+  const url = process.argv[3];
+  const sel = process.argv[4] || null;
+  const b = await chromium.launch({headless: true});
+  try {
+    const p = await b.newPage({userAgent: process.argv[5]});
+    await p.goto(url, {waitUntil: 'domcontentloaded', timeout: 45000});
+    await p.waitForTimeout(2500);
+    let text;
+    if (sel) {
+      const el = await p.$(sel);
+      text = el ? await el.innerText() : '';
+    } else {
+      text = await p.innerText('body');
+    }
+    process.stdout.write(text || '');
+  } finally { await b.close(); }
+})().catch(e => { process.stderr.write(String(e)); process.exit(1); });
+"""
+    p = subprocess.run(
+        ["node", "-e", script, "--", OPENCLAW_NM, url, selector or "", UA],
+        capture_output=True, text=True, timeout=120,
+    )
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or "").strip()[:200])
+    return re.sub(r"\s+", " ", p.stdout).strip()
+
+
+def extract(html, selector):
+    """CSSセレクタが指定されていれば、その中身だけを素朴に切り出す。
+    複雑な指定は Chromium 側に任せるので、ここは id/class の単純な形だけ扱う。"""
+    if not selector:
+        return strip_html(html)
+    m = re.match(r"^#([\w-]+)$", selector)
+    if m:
+        pat = rf'(?is)<([a-z0-9]+)[^>]*id=["\']{re.escape(m.group(1))}["\'][^>]*>(.*?)</\1>'
+    else:
+        m2 = re.match(r"^\.([\w-]+)$", selector)
+        if not m2:
+            return None  # 難しい指定は描画側へ
+        pat = rf'(?is)<([a-z0-9]+)[^>]*class=["\'][^"\']*\b{re.escape(m2.group(1))}\b[^"\']*["\'][^>]*>(.*?)</\1>'
+    found = re.search(pat, html)
+    return strip_html(found.group(2)) if found else None
+
+
+def get_text(item):
+    url, sel = item["url"], item["selector"]
+    try:
+        html = fetch_plain(url)
+        text = extract(html, sel)
+        if text and len(text) > 40:
+            return text
+    except Exception:
+        pass
+    # 素の取得で足りない（JS描画・複雑なセレクタ）ときだけ Chromium を使う
+    return fetch_rendered(url, sel)
+
+
+def main():
+    items = load_conf()
+
+    if "--list" in sys.argv:
+        if not items:
+            print(f"監視対象がありません。{CONF} に書いてください。")
+        else:
+            print(f"監視対象 {len(items)} 件:")
+            for i in items:
+                print(f"  {i['name']}")
+                print(f"    {i['url']}" + (f"  [{i['selector']}]" if i["selector"] else ""))
+        return 0
+
+    if "--reset" in sys.argv:
+        if os.path.exists(STATE):
+            os.remove(STATE)
+        print("記録を消しました。次回は初回扱いになります。")
+        return 0
+
+    if not items:
+        return 0
+
+    try:
+        state = json.load(open(STATE, encoding="utf-8"))
+    except Exception:
+        state = {}
+
+    changed = []
+    for item in items:
+        key = item["url"] + "|" + (item["selector"] or "")
+        try:
+            text = get_text(item)
+        except Exception as e:
+            # 取れない日があっても騒がない（サイト側の一時的な問題が多い）
+            print(f"取得できず: {item['name']} ({str(e)[:80]})", file=sys.stderr)
+            continue
+        if not text:
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        prev = state.get(key)
+        state[key] = {"hash": digest, "at": datetime.now().isoformat(timespec="seconds"),
+                      "sample": text[:300]}
+        if prev is None:
+            continue  # 初回は基準を作るだけ。通知しない。
+        if prev.get("hash") != digest:
+            changed.append((item["name"], item["url"], prev.get("sample", ""), text[:300]))
+
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+
+    if not changed:
+        return 0
+
+    lines = [f"監視しているページに変化がありました（{len(changed)}件）", ""]
+    for name, url, before, after in changed:
+        lines.append(f"■ {name}")
+        lines.append(f"  今: {after[:180]}")
+        if before:
+            lines.append(f"  前: {before[:120]}")
+        lines.append(f"  {url}")
+        lines.append("")
+    notify("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

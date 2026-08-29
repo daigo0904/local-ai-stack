@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""
+morning-brief — 登録テーマを順に調べて Obsidian に保存し、要点だけをまとめて出力する。
+
+テーマは ~/.openclaw/briefing-topics.txt に1行1件で書く。
+出力はそのまま LINE に流す前提なので、短くまとめる。
+
+    morning-brief            # 全テーマを調べる
+    morning-brief --dry-run  # 何を調べる予定かだけ表示
+
+新しい情報が1件も無かった場合は何も出力しない（=沈黙する）。
+cron から --announce で呼ぶと、出力が空のときは送信されない。
+"""
+
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+TOPICS_FILE = os.path.expanduser("~/.openclaw/briefing-topics.txt")
+RESEARCH = os.path.expanduser("~/bin/research-save")
+INBOX = os.path.expanduser("~/知識メモ/Inbox")
+PER_TOPIC_TIMEOUT = 420  # 1テーマあたりの上限（秒）
+
+
+def load_topics():
+    """(表示名, research-save に渡す引数) の列を返す。"""
+    try:
+        with open(TOPICS_FILE, encoding="utf-8") as f:
+            lines = [l.strip() for l in f]
+    except OSError:
+        return []
+
+    topics = []
+    for l in lines:
+        if not l or l.startswith("#"):
+            continue
+        if l.lower().startswith("news:"):
+            q = l.split(":", 1)[1].strip()
+            if q:
+                topics.append((q, ["--news", q]))
+        else:
+            topics.append((l, [l]))
+    return topics
+
+
+def quota_ok(need=15):
+    """残り送信数が極端に少ないときだけ見送る。
+    ブリーフィングは声かけより重要なので、閾値は低くしてぎりぎりまで送る。"""
+    quota = os.path.expanduser("~/bin/line-quota")
+    if not os.path.isfile(quota):
+        return True
+    try:
+        return subprocess.run([quota, "--check", str(need)],
+                              capture_output=True, timeout=30).returncode == 0
+    except Exception:
+        return True
+
+
+def main():
+    topics = load_topics()
+    if not topics:
+        print(f"調べるテーマがありません。{TOPICS_FILE} に書いてください。", file=sys.stderr)
+        return 1
+
+    if "--dry-run" not in sys.argv and not quota_ok(15):
+        # 調べても送れないので、検索とLLMを走らせるだけ無駄になる
+        return 0
+
+    if "--dry-run" in sys.argv:
+        print("次のテーマを調べます:")
+        for name, argv in topics:
+            mode = "ニュース" if "--news" in argv else "通常"
+            print(f" - [{mode}] {name}")
+        return 0
+
+    results = []
+    skipped = []
+
+    for topic, argv in topics:
+        try:
+            p = subprocess.run(
+                [RESEARCH] + argv,
+                capture_output=True, text=True, timeout=PER_TOPIC_TIMEOUT,
+            )
+            out = (p.stdout or "").strip()
+        except subprocess.TimeoutExpired:
+            skipped.append(f"{topic}（時間切れ）")
+            continue
+        except Exception as e:
+            skipped.append(f"{topic}（{e}）")
+            continue
+
+        if not out:
+            skipped.append(f"{topic}（応答なし）")
+            continue
+        if out.startswith("保存しませんでした"):
+            skipped.append(topic)
+            continue
+
+        # 「保存しました: パス」の次の行以降が要点
+        lines = out.splitlines()
+        path = lines[0].replace("保存しました:", "").strip() if lines else ""
+        bullets = [l for l in lines[1:] if l.strip().startswith("-")][:3]
+        results.append((topic, path, bullets))
+
+    today = datetime.now().strftime("%-m月%-d日")
+    print(f"おはようございます。{today}の朝の便りです。")
+    print()
+
+    # 天気と予定は、取れなければ黙って飛ばす（ブリーフィング全体を壊さない）
+    for helper, timeout in (("~/bin/weather-line", 60), ("~/bin/today-schedule", 240)):
+        path = os.path.expanduser(helper)
+        if not os.path.isfile(path):
+            continue
+        try:
+            r = subprocess.run([path], capture_output=True, text=True, timeout=timeout)
+            block = (r.stdout or "").strip()
+            if block:
+                print(block)
+                print()
+        except Exception:
+            pass
+    for topic, path, bullets in results:
+        print(f"■ {topic}")
+        for b in bullets:
+            print(b)
+        print(f"  → {path}")
+        print()
+
+    if not results:
+        print("今朝は目立った新しい話題がありませんでした。")
+    elif skipped:
+        print("（新しい情報が無かったもの: " + "、".join(skipped) + "）")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

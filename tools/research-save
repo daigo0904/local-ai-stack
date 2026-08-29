@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""
+research-save — 検索して精査・圧縮し、Obsidian vault に保存する。
+
+使い方:
+    research-save "調べたいこと"
+
+処理の流れ（仕様書のパイプラインをそのまま実装）:
+  1. Tavily で検索して生データを取得
+  2. Qwen (ollama) に渡してノイズ除去・圧縮・構造化
+  3. 品質判定で価値が低ければ保存せず中断
+  4. YAML フロントマター付きで vault/Inbox に保存
+
+ツール呼び出しを一切使わないので、ローカル小型モデルでも失敗しない。
+"""
+
+import json
+import os
+import re
+import sys
+import unicodedata
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434") + "/api/chat"
+MODEL = os.environ.get("RESEARCH_MODEL", "qwen3:14b-q4_K_M")
+VAULT = os.path.expanduser(os.environ.get("OBSIDIAN_VAULT", "~/知識メモ"))
+INBOX = os.path.join(VAULT, "Inbox")
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+MAX_RESULTS = 5
+MAX_CONTENT_CHARS = 1500  # 1件あたりモデルに渡す本文の上限
+MIN_SOURCES = 2           # 品質判定: これ未満なら保存しない
+
+
+def load_api_key():
+    key = os.environ.get("TAVILY_API_KEY")
+    if key:
+        return key
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("TAVILY_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def tavily_search(query, api_key, news=False):
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": 8 if news else MAX_RESULTS,
+        "search_depth": "advanced",
+        "include_answer": True,
+    }
+    if news:
+        # ニュース専用モード。サイトのトップページではなく実際の記事が日付付きで返る。
+        payload["topic"] = "news"
+        payload["days"] = 1
+        # 実測でノイズになりやすかった配信元を外す（プレスリリース配信・番組表など）
+        payload["exclude_domains"] = [
+            "prtimes.jp", "excite.co.jp", "bangumi.org",
+            "buttondown.com", "sphericalinsights.com",
+        ]
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=90) as r:
+        return json.loads(r.read())
+
+
+def ollama_chat(system, user, timeout=600):
+    """ツールを一切渡さない素の生成。ここが失敗しないことが本スクリプトの肝。"""
+    body = json.dumps({
+        "model": MODEL,
+        "stream": False,
+        "think": False,
+        "keep_alive": "30m",
+        "options": {
+            "num_ctx": 32768,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "top_k": 20,
+        },
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }).encode()
+    req = urllib.request.Request(
+        OLLAMA_URL, data=body, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read())
+    return (d.get("message", {}).get("content") or "").strip()
+
+
+def slugify(text):
+    """ファイル名用に ASCII の英小文字とハイフンだけに落とす。"""
+    text = unicodedata.normalize("NFKD", text)
+    # 非ASCII は空白に置き換える。そのまま消すと単語同士がくっつくため。
+    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+    text = text.encode("ascii", "ignore").decode("ascii").lower()
+    text = re.sub(r"[^a-z0-9\s-]", " ", text)
+    text = re.sub(r"[\s_]+", "-", text).strip("-")
+    text = re.sub(r"-{2,}", "-", text)
+    return text[:60].strip("-")
+
+
+SYSTEM_PROMPT = """あなたは調査結果を Obsidian 用のノートにまとめる編集者です。
+
+渡された検索結果から、次の形式の Markdown を出力してください。出力は Markdown 本体のみで、
+前置き・後書き・コードフェンスは書かないでください。
+
+---
+title: 日本語のタイトル
+date: {date}
+tags: [tag1, tag2, tag3]
+sources:
+  - https://example.com/article
+status: inbox
+---
+
+## 要点
+
+- 箇条書きで3〜6行
+
+## 詳細
+
+本文。
+
+## 出典
+
+- [タイトル](https://example.com/article)
+
+規則:
+- 広告文、煽り文、繰り返し、サイトの案内文は削る。
+- 事実・数字・日付・固有名詞・出典URLは残す。
+- 詳細は400〜1200字。箇条書き中心にする。
+- 推測を書くときは行頭に「推測:」と付け、事実と混ぜない。
+- 出典URLのないことを事実として書かない。
+- tags は3〜5個。スペースは使わずハイフンでつなぐ。
+- sources と出典には、実際に渡された URL だけを書く。
+"""
+
+
+NEWS_PROMPT = """あなたはその日のニュースを1枚のメモにまとめる編集者です。
+
+渡されたニュース記事から、次の形式の Markdown を出力してください。出力は Markdown 本体のみで、
+前置き・後書き・コードフェンスは書かないでください。
+
+---
+title: {title}
+date: {date}
+tags: [ニュース, tag2, tag3]
+sources:
+  - https://example.com/article
+status: inbox
+---
+
+## 見出し
+
+- 記事ごとに1行。何が起きたかを具体的に書く。5〜8件。
+- 数字・固有名詞・日付は落とさない。
+
+## 詳細
+
+特に重要な2〜3件について、それぞれ2〜3文で背景や意味を書く。
+
+## 出典
+
+- [記事タイトル](https://example.com/article)
+
+規則:
+- 渡された記事に書かれていないことは書かない。推測を混ぜない。
+- 広告文、サイトの案内文、「続きを読む」は削る。
+- 同じ出来事の重複記事はまとめて1件にする。
+- sources と出典には、実際に渡された URL だけを書く。
+"""
+
+JUDGE_PROMPT = """あなたは調査結果の品質を判定します。
+渡された検索結果が、質問に対して保存する価値のある情報を含んでいるか判定してください。
+
+SKIP にするのは、次のように明らかに駄目な場合だけです。
+- 検索結果が質問とまったく別の話題
+- 広告・商品購入ページばかりで、事実がひとつも書かれていない
+- 「1+1は」のように、調べるまでもない一般常識だけ
+
+判断に迷ったら必ず OK を選んでください。
+質問に関係する事実・数字・仕様・用語の説明がひとつでもあれば OK です。
+渡されるのは各ページの冒頭部分だけなので、情報が少なく見えても、
+関連するページが並んでいるなら OK と判断してください。
+
+出力は次のどちらか1行のみ。理由は日本語で書いてください。
+OK
+SKIP: 理由
+"""
+
+
+def build_source_text(results):
+    parts = []
+    for i, r in enumerate(results, 1):
+        content = (r.get("content") or "")[:MAX_CONTENT_CHARS]
+        parts.append(
+            f"[{i}] タイトル: {r.get('title','')}\n"
+            f"    URL: {r.get('url','')}\n"
+            f"    本文: {content}"
+        )
+    return "\n\n".join(parts)
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--news"]
+    news = "--news" in sys.argv
+
+    if not args or not args[0].strip():
+        print("使い方: research-save [--news] \"調べたいこと\"", file=sys.stderr)
+        return 2
+
+    query = " ".join(args).strip()
+
+    api_key = load_api_key()
+    if not api_key:
+        print("TAVILY_API_KEY が見つかりません。", file=sys.stderr)
+        return 1
+
+    # 1. 収集
+    try:
+        data = tavily_search(query, api_key, news=news)
+    except urllib.error.HTTPError as e:
+        print(f"検索に失敗しました（HTTP {e.code}）。", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"検索に失敗しました: {e}", file=sys.stderr)
+        return 1
+
+    results = [r for r in data.get("results", []) if r.get("url")]
+
+    # 2. 品質判定（情報源の数）
+    if len(results) < MIN_SOURCES:
+        print(f"保存しませんでした。理由は、有用な情報源が {len(results)} 件しか見つからなかったためです。")
+        return 0
+
+    source_text = build_source_text(results)
+    answer = data.get("answer") or ""
+
+    # 2b. 品質判定（内容）。判定にはタイトルと冒頭だけ渡して軽くする。
+    # ニュースは「その日に起きたこと」なので価値判定は不要。1回分のLLM呼び出しも省ける。
+    if not news:
+        brief = "\n".join(
+            f"[{i}] {r.get('title','')} / {r.get('url','')}\n    {(r.get('content') or '')[:500]}"
+            for i, r in enumerate(results, 1)
+        )
+        judge = ollama_chat(
+            JUDGE_PROMPT,
+            f"質問: {query}\n\n検索結果:\n{brief}",
+            timeout=300,
+        )
+        first_line = judge.strip().splitlines()[0].strip() if judge.strip() else "OK"
+        if first_line.upper().startswith("SKIP"):
+            reason = first_line.split(":", 1)[1].strip() if ":" in first_line else "価値が低いと判断しました"
+            print(f"保存しませんでした。理由は、{reason}")
+            return 0
+
+    # 3. 圧縮・構造化
+    today = datetime.now().strftime("%Y-%m-%d")
+    if news:
+        title = f"{datetime.now().strftime('%-m月%-d日')} {query}"
+        system = NEWS_PROMPT.replace("{date}", today).replace("{title}", title)
+    else:
+        system = SYSTEM_PROMPT.replace("{date}", today)
+    user = f"質問: {query}\n"
+    if answer:
+        user += f"\n検索エンジンの要約: {answer}\n"
+    user += f"\n検索結果:\n{source_text}"
+
+    note = ollama_chat(system, user)
+    if not note:
+        print("保存しませんでした。理由は、要約の生成に失敗したためです。", file=sys.stderr)
+        return 1
+
+    # コードフェンスで包まれていたら剥がす
+    note = re.sub(r"^```(?:markdown|md)?\s*\n", "", note)
+    note = re.sub(r"\n```\s*$", "", note).strip()
+
+    # フロントマターが無ければ最低限を付ける
+    if not note.startswith("---"):
+        note = (
+            f"---\ntitle: {query}\ndate: {today}\ntags: []\n"
+            f"sources:\n" + "".join(f"  - {r['url']}\n" for r in results) +
+            f"status: inbox\n---\n\n" + note
+        )
+
+    # 4. 保存
+    title_match = re.search(r"^title:\s*(.+)$", note, re.M)
+    title = title_match.group(1).strip() if title_match else query
+    slug = slugify(title) or slugify(query) or datetime.now().strftime("note-%H%M")
+    if news and not slug.startswith("news"):
+        # ニュースは日付ごとに並ぶよう接頭辞を付ける
+        slug = ("news-" + slug)[:60].strip("-")
+
+    os.makedirs(INBOX, exist_ok=True)
+    path = os.path.join(INBOX, f"{today}-{slug}.md")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(INBOX, f"{today}-{slug}-{n}.md")
+        n += 1
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(note.rstrip() + "\n")
+
+    # 5. 報告（保存先と要点3行だけ）
+    rel = os.path.join("vault/Inbox", os.path.basename(path))
+    bullets = [
+        ln.strip() for ln in note.splitlines()
+        if ln.strip().startswith("- ") and "http" not in ln
+    ][:3]
+    print(f"保存しました: {rel}")
+    for b in bullets:
+        print(b)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

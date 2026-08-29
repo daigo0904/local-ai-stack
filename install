@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""
+install — この一式を Mac に入れる。
+
+    ./install            全部入れる
+    ./install --check    何が入っているか見る
+    ./install guards     一部だけ入れる（guards / openclaw / tools / qwc）
+
+入るもの:
+  qwc       ~/コーディングCLI に置いて ~/bin/qwc から呼べるようにする
+  guards    見張り3つ＋claw を ~/bin に置き、launchd に登録する
+  openclaw  設定のひな形を ~/.openclaw に置く（鍵は自分で埋める）
+  tools     日々の道具22本を ~/bin に置く
+
+先に入れておくもの:
+  - ollama（頭脳）        brew install ollama && ollama pull gemma4:26b
+  - OpenClaw（受け口）    npm i -g openclaw
+  どちらも別プロジェクト。この一式はその上に載る。
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, "bin")
+
+PARTS = ["qwc", "guards", "openclaw", "tools"]
+
+
+def run_child(part):
+    """guards と openclaw は自分の install を持っている。そちらに任せる。
+
+    親がまとめて面倒を見ないのは、それぞれ単独でも入れられるようにしておくため。
+    片方だけ使いたい人に、要らないほうまで入れさせない。"""
+    child = os.path.join(HERE, part, "install")
+    if not os.path.exists(child):
+        return False
+    print(f"\n── {part} ──")
+    subprocess.run([sys.executable, child])
+    return True
+
+
+def install_tools():
+    print("\n── tools ──")
+    os.makedirs(BIN, exist_ok=True)
+    src_dir = os.path.join(HERE, "tools")
+    n = 0
+    for fn in sorted(os.listdir(src_dir)):
+        src = os.path.join(src_dir, fn)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(BIN, fn)
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o755)
+        n += 1
+    print(f"  {n} 本を {BIN} に置いた")
+
+
+def install_qwc():
+    print("\n── qwc ──")
+    dst = os.path.join(HOME, "コーディングCLI")
+    src = os.path.join(HERE, "qwc")
+    if os.path.exists(dst):
+        print(f"  すでにある（触らない）  {dst}")
+    else:
+        shutil.copytree(src, dst)
+        print(f"  置いた  {dst}")
+    os.makedirs(BIN, exist_ok=True)
+    link = os.path.join(BIN, "qwc")
+    target = os.path.join(dst, "bin", "qwc.mjs")
+    if os.path.islink(link) or os.path.exists(link):
+        os.remove(link)
+    os.symlink(target, link)
+    os.chmod(target, 0o755)
+    print(f"  つないだ  {link} → {target}")
+
+
+def check():
+    print("入っているもの:")
+    print(f"  {'●' if os.path.exists(os.path.join(BIN,'qwc')) else '○'} qwc")
+    out = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+    for label in ["ai.openclaw.model-guard", "ai.openclaw.watchdog", "ai.openclaw.line-guard"]:
+        print(f"  {'●' if label in out else '○'} {label}")
+    print(f"  {'●' if os.path.exists(os.path.join(HOME,'.openclaw','openclaw.json')) else '○'} openclaw.json")
+    n = len([f for f in os.listdir(os.path.join(HERE, "tools"))
+             if os.path.exists(os.path.join(BIN, f))])
+    print(f"  {'●' if n else '○'} tools（{n} 本）")
+    print("\n  中身まで見るなら: claw status")
+
+
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if "--check" in sys.argv[1:]:
+        check()
+        sys.exit(0)
+    want = args or PARTS
+    for part in want:
+        if part == "tools":
+            install_tools()
+        elif part == "qwc":
+            install_qwc()
+        else:
+            run_child(part)
+    print()
+    check()

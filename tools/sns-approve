@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""
+sns-approve — 承認された下書きだけを Bluesky に投稿する。
+
+    sns-approve --list       待っている下書きを見る
+    sns-approve 3            3番を投稿する
+    sns-approve 3 --drop     3番を破棄する
+    sns-approve 3 --show     3番の中身だけ見る
+
+投稿できるのはこのコマンドだけで、下書きを作る sns-draft は投稿しない。
+「作る側」と「出す側」を分けてあるので、下書きが勝手に公開されることはない。
+
+LINE から「投稿 3」と言われたエージェントがこれを実行する想定。
+渡す引数が数字ひとつだけなのは、ローカルの14Bモデルに長い引数を持たせると
+呼び出しごと失敗するため。
+"""
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+
+QUEUE_FILE = os.path.expanduser("~/.openclaw/sns-queue.json")
+BSKY_POST = os.path.expanduser("~/bin/bsky-post")
+
+
+def load_queue():
+    try:
+        with open(QUEUE_FILE) as f:
+            q = json.load(f)
+    except (OSError, ValueError):
+        q = {}
+    q.setdefault("next_id", 1)
+    q.setdefault("items", [])
+    return q
+
+
+def save_queue(q):
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(q, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, QUEUE_FILE)
+    os.chmod(QUEUE_FILE, 0o600)
+
+
+def find(q, item_id):
+    for item in q["items"]:
+        if item.get("id") == item_id:
+            return item
+    return None
+
+
+def show_list(q):
+    pending = [i for i in q["items"] if i.get("status") == "pending"]
+    if not pending:
+        print("承認待ちの下書きはありません。")
+        return 0
+    for i in pending:
+        head = i["text"].replace("\n", " ")[:60]
+        print(f"#{i['id']}  {i.get('topic','')}  {i.get('created','')}")
+        print(f"     {head}…")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    q = load_queue()
+
+    if not args or "--list" in args:
+        return show_list(q)
+
+    try:
+        item_id = int(args[0])
+    except ValueError:
+        print("使い方: sns-approve <番号> [--drop|--show]", file=sys.stderr)
+        return 2
+
+    item = find(q, item_id)
+    if not item:
+        print(f"下書き #{item_id} は見つかりません。", file=sys.stderr)
+        return 1
+
+    if "--show" in args:
+        print(f"#{item_id}（{item.get('topic','')}）")
+        print(item["text"])
+        return 0
+
+    if "--drop" in args:
+        item["status"] = "dropped"
+        item["decided"] = datetime.now().isoformat(timespec="seconds")
+        save_queue(q)
+        print(f"下書き #{item_id} を破棄しました。")
+        return 0
+
+    if item.get("status") == "posted":
+        print(f"下書き #{item_id} は投稿済みです: {item.get('url','')}")
+        return 0
+    if item.get("status") == "dropped":
+        print(f"下書き #{item_id} は破棄済みです。投稿しません。", file=sys.stderr)
+        return 1
+
+    p = subprocess.run([BSKY_POST, item["text"]], capture_output=True, text=True, timeout=120)
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+    if p.returncode != 0:
+        print(err or "投稿に失敗しました。", file=sys.stderr)
+        return 1
+
+    item["status"] = "posted"
+    item["decided"] = datetime.now().isoformat(timespec="seconds")
+    # 「投稿しました: URL」の URL 部分を控えておく
+    item["url"] = out.split(": ", 1)[1].strip() if ": " in out else out
+    save_queue(q)
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

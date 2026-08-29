@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+vault-tidy — Obsidian の Inbox に溜まったノートを整理する。
+
+  1. ニュースのノートは Topics/ニュース/年-月/ へ移す（日々増えるため）
+  2. それ以外の古いノート（既定14日以上前）は Topics/年-月/ へ移す
+  3. 中身がほぼ同じ重複ノートを見つけて知らせる（消しはしない）
+
+Inbox は「まだ読んでいないもの」の置き場として保ち、読み終わった頃合いの
+ものを月別に片付ける、という考え方。消す操作は一切しない。
+
+    vault-tidy            下見（何も動かさない）
+    vault-tidy --apply    実際に整理する
+"""
+
+import os
+import re
+import shutil
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+VAULT = os.path.expanduser("~/知識メモ")
+INBOX = os.path.join(VAULT, "Inbox")
+TOPICS = os.path.join(VAULT, "Topics")
+AGE_DAYS = 14  # これより古い普通のノートを片付ける
+
+DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-")
+
+
+def note_date(name):
+    m = DATE_RE.match(name)
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def is_news(name, path):
+    if "-news-" in name or name.startswith("news-"):
+        return True
+    try:
+        with open(path, encoding="utf-8") as f:
+            head = f.read(400)
+        return bool(re.search(r"^tags:.*ニュース", head, re.M))
+    except OSError:
+        return False
+
+
+def plan():
+    if not os.path.isdir(INBOX):
+        return [], {}
+    moves = []
+    now = datetime.now()
+    by_content = defaultdict(list)
+
+    for name in sorted(os.listdir(INBOX)):
+        if not name.endswith(".md"):
+            continue
+        src = os.path.join(INBOX, name)
+        if not os.path.isfile(src):
+            continue
+
+        d = note_date(name) or datetime.fromtimestamp(os.path.getmtime(src))
+        ym = d.strftime("%Y-%m")
+
+        # 重複の目印として「要点」の1行目を拾う
+        try:
+            with open(src, encoding="utf-8") as f:
+                text = f.read()
+            key = ""
+            m = re.search(r"^##\s*(要点|見出し)\s*\n+\s*-\s*(.+)$", text, re.M)
+            if m:
+                key = m.group(2).strip()[:60]
+            if key:
+                by_content[key].append(name)
+        except OSError:
+            pass
+
+        if is_news(name, src):
+            dst_dir = os.path.join(TOPICS, "ニュース", ym)
+        elif (now - d) >= timedelta(days=AGE_DAYS):
+            dst_dir = os.path.join(TOPICS, ym)
+        else:
+            continue  # 最近の普通のノートは Inbox に残す
+
+        moves.append((src, os.path.join(dst_dir, name)))
+
+    dups = {k: v for k, v in by_content.items() if len(v) > 1}
+    return moves, dups
+
+
+def unique_path(path):
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{base}-{n}{ext}"):
+        n += 1
+    return f"{base}-{n}{ext}"
+
+
+def main():
+    moves, dups = plan()
+    apply_it = "--apply" in sys.argv
+
+    if not moves and not dups:
+        print("Inbox は整っています。移すものはありません。")
+        return 0
+
+    if moves:
+        grouped = defaultdict(list)
+        for src, dst in moves:
+            grouped[os.path.dirname(dst)].append(os.path.basename(src))
+        print(f"{'整理しました' if apply_it else '下見'}: {len(moves)}件")
+        for folder, names in sorted(grouped.items()):
+            rel = os.path.relpath(folder, VAULT)
+            print(f"  {rel}/ ← {len(names)}件")
+            for n in names[:4]:
+                print(f"      {n}")
+            if len(names) > 4:
+                print(f"      ほか{len(names)-4}件")
+
+    if apply_it:
+        done = 0
+        for src, dst in moves:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            try:
+                shutil.move(src, unique_path(dst))
+                done += 1
+            except Exception as e:
+                print(f"  移動できず: {os.path.basename(src)} ({e})")
+        print(f"{done}件を移しました。")
+
+    if dups:
+        print("\n中身が似ているノート（消していません。必要なら手で確認を）:")
+        for key, names in list(dups.items())[:5]:
+            print(f"  「{key}…」")
+            for n in names:
+                print(f"      {n}")
+
+    if not apply_it and moves:
+        print("\nこの通りで良ければ: vault-tidy --apply")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

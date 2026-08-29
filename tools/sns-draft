@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""
+sns-draft — 最近の出来事を調べて、SNS の下書きを作る。投稿はしない。
+
+    sns-draft                テーマ一覧から順に1つ選んで作る
+    sns-draft "テーマ"        テーマを指定して作る
+    sns-draft --note         note 用の長い下書きも書いて Obsidian に置く
+    sns-draft --no-send      LINE に送らず画面に出すだけ（下見用）
+    sns-draft --quiet        画面には何も出さない（定時実行用）
+
+流れ:
+  1. Tavily でここ数日の実際の記事を集める
+  2. qwen3:14b に Bluesky 用の短文を書かせる（出典URLを必ず入れる）
+  3. 下書き置き場（~/.openclaw/sns-queue.json）に入れる
+  4. LINE に「これを出しますか」と送る
+
+**ここでは絶対に投稿しない。** 公開は承認を受けた sns-approve だけが行う。
+14B は事実を取り違えることがあり、公開したものは取り消せないため。
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。
+
+    ここに直書きしない。この一式を公開したときに、
+    自分を指すID（永久に変えられない）が出てしまうため。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+QUEUE_FILE = os.path.expanduser("~/.openclaw/sns-queue.json")
+TOPICS_FILE = os.path.expanduser("~/.openclaw/sns-topics.txt")
+VAULT = os.path.expanduser(os.environ.get("OBSIDIAN_VAULT", "~/知識メモ"))
+NOTE_DIR = os.path.join(VAULT, "SNS")
+
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434") + "/api/chat"
+MODEL = os.environ.get("SNS_MODEL", "qwen3:14b-q4_K_M")
+
+LINE_USER_ID = env_value("LINE_USER_ID")
+DISCORD_CHANNEL_ID = env_value("DISCORD_CHANNEL_ID")
+
+# Bluesky の上限は300字だが、承認時に一言足せる余裕を残す
+POST_LIMIT = 260
+QUOTA_FLOOR = 30  # LINE の残数がこれを下回ったら Discord に回す
+
+
+def load_env(name):
+    v = os.environ.get(name)
+    if v:
+        return v
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def tavily_news(query, api_key):
+    """topic=news と days を付けないとサイトのトップページばかり返るので必ず付ける。"""
+    body = json.dumps({
+        "api_key": api_key,
+        "query": query,
+        "max_results": 6,
+        "search_depth": "advanced",
+        "include_answer": True,
+        "topic": "news",
+        "days": 3,
+        "exclude_domains": [
+            "prtimes.jp", "excite.co.jp", "bangumi.org",
+            "buttondown.com", "sphericalinsights.com",
+        ],
+    }).encode()
+    req = urllib.request.Request("https://api.tavily.com/search", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        return json.loads(r.read())
+
+
+def ollama(system, user, timeout=600, temperature=0.4):
+    body = json.dumps({
+        "model": MODEL, "stream": False, "think": False, "keep_alive": "30m",
+        "options": {"num_ctx": 32768, "temperature": temperature, "top_p": 0.9, "top_k": 20},
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+    }).encode()
+    req = urllib.request.Request(OLLAMA_URL, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return (json.loads(r.read()).get("message", {}).get("content") or "").strip()
+
+
+POST_SYSTEM = """あなたは Bluesky に短い投稿を書く人です。渡された記事だけを材料にします。
+
+守ること:
+- 全体で{limit}文字以内。これは絶対。
+- **渡された記事に書いていないことは一切書かない。** 数字・日付・バージョン番号を
+  自分の記憶から補ってはいけない。記事に無ければ書かない。
+- 出典のURLを本文の最後に1つだけ入れる。
+- 事実を1〜2個に絞って、自分の受け取り方を一言添える。
+- 宣伝文句・煽り・「必見」「衝撃」のような言葉は使わない。
+- ハッシュタグは付けても1つまで。
+- 前置きや説明は書かず、投稿本文だけを出力する。カギ括弧で囲まない。
+"""
+
+NOTE_SYSTEM = """あなたは note の記事の下書きを書く編集者です。渡された記事だけを材料にします。
+
+守ること:
+- **渡された記事に書いていないことは書かない。** 記憶で補わない。
+- 見出し(##)を3つ程度使い、1200〜2000字程度でまとめる。
+- 最後に「出典」の節を作り、参照したURLを箇条書きで並べる。
+- 断定できないことは「〜とされている」と書く。
+- 出力は Markdown 本体のみ。前置きもコードフェンスも書かない。
+"""
+
+
+def sources_block(data):
+    lines = []
+    for r in (data.get("results") or [])[:6]:
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        content = re.sub(r"\s+", " ", (r.get("content") or "")).strip()[:1200]
+        date = (r.get("published_date") or "").strip()
+        lines.append(f"- 見出し: {title}\n  日付: {date}\n  URL: {url}\n  本文: {content}")
+    return "\n".join(lines)
+
+
+def clean_post(text):
+    """モデルが付けがちな飾りを落とす。"""
+    text = text.strip()
+    text = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text).strip()
+    # 全体が引用符で囲まれていたら外す
+    if len(text) > 2 and text[0] in "「\"'" and text[-1] in "」\"'":
+        text = text[1:-1].strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def make_post(topic, data):
+    user = (f"テーマ: {topic}\n\n以下が集めた記事です。\n\n{sources_block(data)}\n\n"
+            f"これを材料に、Bluesky の投稿を{POST_LIMIT}文字以内で書いてください。")
+    text = clean_post(ollama(POST_SYSTEM.format(limit=POST_LIMIT), user))
+    if len(text) > POST_LIMIT:
+        # 一度だけ、短く書き直させる
+        text = clean_post(ollama(
+            POST_SYSTEM.format(limit=POST_LIMIT),
+            user + f"\n\n前回の下書きは{len(text)}文字で長すぎました。"
+                   f"内容を削って{POST_LIMIT}文字以内に収めてください。",
+            temperature=0.2))
+    return text
+
+
+def load_queue():
+    try:
+        with open(QUEUE_FILE) as f:
+            q = json.load(f)
+    except (OSError, ValueError):
+        q = {}
+    q.setdefault("next_id", 1)
+    q.setdefault("items", [])
+    return q
+
+
+def save_queue(q):
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(q, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, QUEUE_FILE)
+    os.chmod(QUEUE_FILE, 0o600)
+
+
+def push_line(text):
+    token = load_env("LINE_CHANNEL_ACCESS_TOKEN")
+    if not token:
+        return False
+    body = json.dumps({"to": LINE_USER_ID,
+                       "messages": [{"type": "text", "text": text[:4900]}]}).encode()
+    req = urllib.request.Request(
+        "https://api.line.me/v2/bot/message/push", data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+        return True
+    except Exception as e:
+        print(f"LINE に送れませんでした: {e}", file=sys.stderr)
+        return False
+
+
+def push_discord(text):
+    token = load_env("DISCORD_BOT_TOKEN")
+    if not token:
+        return False
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+        data=body, headers={"Content-Type": "application/json",
+                            "Authorization": f"Bot {token}",
+                            "User-Agent": "sns-draft (local, 1.0)"})
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+        return True
+    except Exception as e:
+        print(f"Discord に送れませんでした: {e}", file=sys.stderr)
+        return False
+
+
+def line_has_room():
+    """LINE の無料枠は月200通しかない。少なくなったら Discord に回す。"""
+    try:
+        p = subprocess.run([os.path.expanduser("~/bin/line-quota"), "--check", str(QUOTA_FLOOR)],
+                           capture_output=True, timeout=30)
+        return p.returncode == 0
+    except Exception:
+        return True
+
+
+def pick_topic():
+    """テーマ一覧から、前回の続きを1つ選ぶ。"""
+    try:
+        with open(TOPICS_FILE) as f:
+            topics = [l.strip() for l in f
+                      if l.strip() and not l.strip().startswith("#")]
+    except OSError:
+        topics = []
+    if not topics:
+        return None
+    q = load_queue()
+    used = q.get("topic_cursor", 0)
+    q["topic_cursor"] = (used + 1) % len(topics)
+    save_queue(q)
+    return topics[used % len(topics)]
+
+
+def save_note_draft(topic, data):
+    os.makedirs(NOTE_DIR, exist_ok=True)
+    user = (f"テーマ: {topic}\n\n以下が集めた記事です。\n\n{sources_block(data)}\n\n"
+            f"これを材料に note の記事の下書きを書いてください。")
+    body = ollama(NOTE_SYSTEM, user)
+    body = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", body.strip()).strip()
+    today = datetime.now().strftime("%Y-%m-%d")
+    slug = re.sub(r"[^\w一-龥ぁ-んァ-ヶー]+", "-", topic).strip("-")[:40]
+    path = os.path.join(NOTE_DIR, f"{today}-{slug}.md")
+    with open(path, "w") as f:
+        f.write(f"---\ntitle: {topic}\ndate: {today}\nstatus: 下書き\n"
+                f"source: sns-draft\n---\n\n{body}\n")
+    return path
+
+
+def main():
+    args = sys.argv[1:]
+    no_send = "--no-send" in args
+    want_note = "--note" in args
+    # 定時実行はこの出力を「配信すべき文章」とみなして送ってしまうので、
+    # cron からは --quiet で呼ぶ。下書き本体は LINE へ別途送られている。
+    quiet = "--quiet" in args
+    topic = " ".join(a for a in args if not a.startswith("--")).strip() or pick_topic()
+
+    if not topic:
+        print(f"テーマがありません。{TOPICS_FILE} に1行1テーマで書くか、"
+              f'sns-draft "テーマ" と指定してください。', file=sys.stderr)
+        return 2
+
+    api_key = load_env("TAVILY_API_KEY")
+    if not api_key:
+        print("TAVILY_API_KEY がありません。", file=sys.stderr)
+        return 2
+
+    try:
+        data = tavily_news(topic, api_key)
+    except Exception as e:
+        print(f"検索に失敗しました: {e}", file=sys.stderr)
+        return 1
+
+    results = data.get("results") or []
+    if len(results) < 2:
+        # 材料が薄いまま書かせると作り話になる
+        if not quiet:
+            print(f"「{topic}」について、ここ数日の記事が{len(results)}件しか見つかりませんでした。"
+                  f"下書きは作りません。")
+        return 0
+
+    text = make_post(topic, data)
+    if not text:
+        print("下書きを作れませんでした。", file=sys.stderr)
+        return 1
+
+    over = len(text) - 300
+    warn = f"\n※{len(text)}文字あり上限300字を超えています。承認前に直してください。" if over > 0 else ""
+
+    note_path = save_note_draft(topic, data) if want_note else None
+
+    if no_send:
+        print(f"--- テーマ: {topic} ---")
+        print(text)
+        print(f"--- {len(text)}文字 / 材料{len(results)}件 ---")
+        if note_path:
+            print(f"note の下書き: {note_path}")
+        return 0
+
+    q = load_queue()
+    item_id = q["next_id"]
+    q["next_id"] += 1
+    q["items"].append({
+        "id": item_id, "topic": topic, "text": text,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "status": "pending",
+        "sources": [r.get("url") for r in results[:3]],
+        "note_draft": note_path,
+    })
+    save_queue(q)
+
+    msg = (f"Bluesky の下書き #{item_id}（{topic}）\n\n{text}\n\n"
+           f"（{len(text)}文字）{warn}\n\n"
+           f"出すなら「投稿 {item_id}」、いらないなら「やめ {item_id}」と返信してください。")
+    if note_path:
+        msg += f"\nnote の下書きも Obsidian の SNS フォルダに置きました。"
+
+    sent = push_line(msg) if line_has_room() else False
+    if not sent:
+        sent = push_discord(msg)
+    if not quiet:
+        print(f"下書き #{item_id} を作りました。" + ("送信済みです。" if sent else "送信はできませんでした。"))
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
