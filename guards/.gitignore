@@ -1,0 +1,5 @@
+.env
+*.log
+*.bak
+*.bak-*
+.DS_Store

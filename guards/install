@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""
+install — このMacに見張りを入れる。
+
+    ./install            入れる（もう入っていれば入れ直す）
+    ./install --check    入っているかだけ見る
+    ./install --uninstall  外す
+
+やること:
+  1. guards/* を ~/bin に置く
+  2. launchd/*.template から plist を作って ~/Library/LaunchAgents に置く
+  3. launchctl に登録して走らせる
+  4. 知らせ先（Discord）が設定されているか確かめる
+
+plist をテンプレートにしてあるのは、中に絶対パスを書く必要があるため。
+launchd は ~ を展開しないので、入れる人の HOME をここで埋める。
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, "bin")
+AGENTS = os.path.join(HOME, "Library", "LaunchAgents")
+ENV_FILE = os.path.join(HOME, ".openclaw", ".env")
+
+GUARDS = ["model-guard", "watchdog", "line-guard", "claw"]
+LABELS = ["ai.openclaw.model-guard", "ai.openclaw.watchdog", "ai.openclaw.line-guard"]
+
+# 知らせ先。無くても見張りは動くが、直したことが誰にも届かなくなる。
+NEEDED_KEYS = ["DISCORD_BOT_TOKEN", "DISCORD_CHANNEL_ID"]
+
+
+def launchctl(*args):
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True)
+
+
+def env_has(key):
+    try:
+        with open(ENV_FILE) as f:
+            return any(row.strip().startswith(f"{key}=") for row in f)
+    except OSError:
+        return False
+
+
+def do_install():
+    os.makedirs(BIN, exist_ok=True)
+    os.makedirs(AGENTS, exist_ok=True)
+
+    for name in GUARDS:
+        src = os.path.join(HERE, "guards", name)
+        dst = os.path.join(BIN, name)
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o755)
+        print(f"  置いた  {dst}")
+
+    for label in LABELS:
+        tpl = os.path.join(HERE, "launchd", f"{label}.plist.template")
+        dst = os.path.join(AGENTS, f"{label}.plist")
+        with open(tpl) as f:
+            body = f.read().replace("__HOME__", HOME)
+        with open(dst, "w") as f:
+            f.write(body)
+        # 入れ直しのときは、いったん外してから入れる
+        launchctl("bootout", f"gui/{os.getuid()}/{label}")
+        r = launchctl("bootstrap", f"gui/{os.getuid()}", dst)
+        ok = r.returncode == 0
+        print(f"  登録{'した' if ok else 'できなかった'}  {label}")
+
+    print()
+    missing = [k for k in NEEDED_KEYS if not env_has(k)]
+    if missing:
+        print(f"  ! {ENV_FILE} に {' と '.join(missing)} がありません。")
+        print("    このままでも見張りは動きますが、直したことが Discord に届きません。")
+    else:
+        print("  知らせ先（Discord）は設定済みです。")
+
+
+def do_uninstall():
+    for label in LABELS:
+        launchctl("bootout", f"gui/{os.getuid()}/{label}")
+        p = os.path.join(AGENTS, f"{label}.plist")
+        if os.path.exists(p):
+            os.remove(p)
+        print(f"  外した  {label}")
+    print("\n  ~/bin のスクリプトは消していません。要らなければ手で消してください。")
+
+
+def do_check():
+    out = launchctl("list").stdout
+    for label in LABELS:
+        print(f"  {'●' if label in out else '○'} {label}")
+    for k in NEEDED_KEYS:
+        print(f"  {'●' if env_has(k) else '○'} {k}")
+    print("\n  中身まで見るなら: watchdog --report / model-guard --report")
+
+
+if __name__ == "__main__":
+    args = set(sys.argv[1:])
+    if "--uninstall" in args:
+        do_uninstall()
+    elif "--check" in args:
+        do_check()
+    else:
+        do_install()
+        print()
+        do_check()
