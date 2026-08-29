@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+*.log
+# 鍵の置き場は ~/.qwythos-code/.env だが、
+# 作業フォルダに置かれたものを取り込まないよう念のため
+.env
+.env.*
