@@ -1,0 +1,214 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "ollama": {
+        "baseUrl": "http://127.0.0.1:11434",
+        "apiKey": {
+          "source": "env",
+          "provider": "default",
+          "id": "OLLAMA_API_KEY"
+        },
+        "api": "ollama",
+        "timeoutSeconds": 600,
+        "contextWindow": 65536,
+        "maxTokens": 16384,
+        "models": [
+          {
+            "id": "qwen3:14b-q4_K_M",
+            "name": "Qwen3 14B Q4_K_M (local)",
+            "input": [
+              "text"
+            ],
+            "contextWindow": 32768,
+            "maxTokens": 8192,
+            "params": {
+              "num_ctx": 32768,
+              "think": true,
+              "keep_alive": "30m",
+              "temperature": 0.2,
+              "top_p": 0.9,
+              "top_k": 20,
+              "repeat_penalty": 1.05
+            }
+          },
+          {
+            "id": "gemma4:26b",
+            "name": "Gemma 4 26B (MoE, local)",
+            "input": [
+              "text",
+              "image"
+            ],
+            "contextWindow": 65536,
+            "maxTokens": 16384,
+            "params": {
+              "num_ctx": 65536,
+              "keep_alive": -1
+            }
+          },
+          {
+            "id": "qwythos",
+            "name": "Qwythos-9B (Claude Mythos, local)",
+            "input": [
+              "text"
+            ],
+            "contextWindow": 65536,
+            "maxTokens": 16384,
+            "params": {
+              "num_ctx": 65536,
+              "keep_alive": "30m",
+              "temperature": 0.6,
+              "top_p": 0.95,
+              "top_k": 20,
+              "repeat_penalty": 1.05
+            }
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "ollama/gemma4:26b"
+      },
+      "experimental": {
+        "localModelLean": false
+      },
+      "memorySearch": {
+        "provider": "ollama",
+        "model": "qwen3-embedding:0.6b",
+        "enabled": true
+      },
+      "silentReply": {
+        "group": "disallow",
+        "internal": "disallow"
+      },
+      "typingMode": "instant",
+      "typingIntervalSeconds": 6,
+      "compaction": {
+        "reserveTokensFloor": 20000
+      }
+    }
+  },
+  "meta": {
+    "lastTouchedVersion": "2026.7.1-2",
+    "lastTouchedAt": "2026-08-29T00:01:19.241Z"
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": {
+        "source": "env",
+        "provider": "default",
+        "id": "OPENCLAW_GATEWAY_TOKEN"
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "tavily": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "tavily-mcp@0.2.21"
+        ],
+        "toolFilter": {
+          "include": [
+            "tavily_extract",
+            "tavily_search"
+          ]
+        },
+        "enabled": false
+      },
+      "vault": {
+        "command": "__HOME__/bin/vault-mcp",
+        "args": [],
+        "enabled": true
+      }
+    }
+  },
+  "channels": {
+    "discord": {
+      "enabled": true,
+      "token": {
+        "source": "env",
+        "provider": "default",
+        "id": "DISCORD_BOT_TOKEN"
+      },
+      "dmPolicy": "allowlist",
+      "groupPolicy": "allowlist",
+      "gatewayInfoTimeoutMs": 30000,
+      "gatewayReadyTimeoutMs": 60000,
+      "gatewayRuntimeReadyTimeoutMs": 60000,
+      "allowFrom": [
+        "Discord の自分のユーザーIDをここに"
+      ],
+      "guilds": {
+        "Discord のチャンネルIDをここに": {
+          "requireMention": true,
+          "users": [
+            "Discord の自分のユーザーIDをここに"
+          ],
+          "channels": {
+            "知らせを流す Discord チャンネルIDをここに": {
+              "requireMention": false
+            }
+          }
+        }
+      }
+    },
+    "line": {
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "groupPolicy": "disabled"
+    }
+  },
+  "plugins": {
+    "entries": {
+      "discord": {
+        "enabled": true
+      },
+      "line": {
+        "enabled": true
+      }
+    },
+    "allow": [
+      "discord",
+      "line"
+    ]
+  },
+  "tools": {
+    "toolSearch": false,
+    "exec": {
+      "security": "allowlist",
+      "ask": "on-miss",
+      "strictInlineEval": true,
+      "applyPatch": {
+        "enabled": false
+      }
+    }
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "command-logger": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "skills": {
+    "limits": {
+      "maxSkillsInPrompt": 8
+    }
+  },
+  "commands": {
+    "ownerAllowFrom": [
+      "line:LINE の自分のユーザーIDをここに",
+      "discord:Discord の自分のユーザーIDをここに"
+    ]
+  }
+}
