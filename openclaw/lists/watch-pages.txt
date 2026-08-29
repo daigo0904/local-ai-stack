@@ -1,0 +1,21 @@
+# 変化を見張るページ。1行に1件。
+#
+#   URL                      ページ全体を見る
+#   URL | CSSセレクタ         その部分だけ見る（おすすめ・誤検知が減る）
+#   URL | CSSセレクタ | 名前   通知に表示する名前
+#
+# # で始まる行は無視されます。初回は基準を作るだけで通知しません。
+#
+# 選び方のコツ:
+#   ふつうのページは「更新 3日前」「23.6M ダウンロード」のような数字が
+#   毎日動くので、変化していないのに通知が飛ぶ。
+#   Atom フィードや raw のテキスト、API の JSON を選ぶと、
+#   本当に新しい版が出たときだけ動く。
+
+# 自分が使っている道具の新しい版。ここが動いたときは、たいてい自分に関係がある。
+https://github.com/ollama/ollama/releases.atom | | Ollama の新しい版
+https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md | | Claude Code の更新
+https://registry.npmjs.org/openclaw/latest | | OpenClaw の新しい版
+
+# 無料枠が変わると自分の使い方に直接ひびく。
+https://www.tavily.com/pricing | | Tavily の料金

@@ -1,0 +1,17 @@
+# 実物の設定と鍵は絶対に入れない
+.env
+openclaw.json
+*-state.json
+credentials/
+identity/
+devices/
+service-env/
+agents/*/sessions/
+logs/
+cache/
+tmp/
+npm/
+state/
+*.bak
+*.bak-*
+.DS_Store

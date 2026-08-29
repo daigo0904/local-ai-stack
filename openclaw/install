@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""
+install — この設定を ~/.openclaw に置く。
+
+    ./install            置く（すでにある実物は上書きしない）
+    ./install --force    実物も上書きする（先に控えを取る）
+    ./install --check    何が置かれているか見る
+
+ここに入っているのは**ひな形**で、実物ではない。
+鍵と、自分を指すID（LINE / Discord のユーザーIDやチャンネルID）は抜いてある。
+置いたあとで、その2つを手で埋める必要がある。
+
+パスを __HOME__ にしてあるのは、AGENTS.md の中で
+「~ は使わず絶対パスで書く」と決めているため（`~` だと道具が失敗する）。
+入れる人の HOME をここで埋める。
+"""
+
+import os
+import shutil
+import sys
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
+DEST = os.path.join(HOME, ".openclaw")
+
+# (ここのファイル, 置き先) の対。__HOME__ を埋めるものは fill=True。
+PLAN = [
+    ("openclaw.json.example", "openclaw.json", True),
+    ("agents/workspace.AGENTS.md", "workspace/AGENTS.md", True),
+    ("agents/workspace-omnical.AGENTS.md", "workspace-omnical/AGENTS.md", True),
+    ("lists/briefing-topics.txt", "briefing-topics.txt", False),
+    ("lists/sns-topics.txt", "sns-topics.txt", False),
+    ("lists/watch-pages.txt", "watch-pages.txt", False),
+    ("lists/qwc-projects.txt", "qwc-projects.txt", True),
+]
+
+PLACEHOLDER = "ここに"
+
+
+def place(force):
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    for src_rel, dst_rel, fill in PLAN:
+        src = os.path.join(HERE, src_rel)
+        dst = os.path.join(DEST, dst_rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+        if os.path.exists(dst) and not force:
+            print(f"  すでにある（触らない）  {dst_rel}")
+            continue
+        if os.path.exists(dst):
+            # 上書きする前に、必ず戻せるようにしておく
+            shutil.copy2(dst, f"{dst}.bak-{stamp}")
+            print(f"  控えを取った  {dst_rel}.bak-{stamp}")
+
+        with open(src) as f:
+            body = f.read()
+        if fill:
+            body = body.replace("__HOME__", HOME)
+        with open(dst, "w") as f:
+            f.write(body)
+        print(f"  置いた  {dst_rel}")
+
+    env = os.path.join(DEST, ".env")
+    if not os.path.exists(env):
+        shutil.copy2(os.path.join(HERE, ".env.example"), env)
+        print(f"  置いた  .env（中身はひな形なので書き換えが要る）")
+    else:
+        print(f"  すでにある（触らない）  .env")
+
+
+def check():
+    missing = []
+    for _, dst_rel, _ in PLAN + [(None, ".env", None)]:
+        p = os.path.join(DEST, dst_rel)
+        print(f"  {'●' if os.path.exists(p) else '○'} {dst_rel}")
+        if not os.path.exists(p):
+            missing.append(dst_rel)
+
+    # ひな形のまま残っている箇所を数える。埋め忘れると静かに動かない。
+    left = 0
+    for _, dst_rel, _ in PLAN:
+        p = os.path.join(DEST, dst_rel)
+        try:
+            with open(p) as f:
+                left += f.read().count(PLACEHOLDER)
+        except OSError:
+            pass
+    env = os.path.join(DEST, ".env")
+    try:
+        with open(env) as f:
+            left += sum(1 for row in f if row.strip().endswith("please"))
+    except OSError:
+        pass
+
+    print()
+    if left:
+        print(f"  ! ひな形のまま残っている箇所が {left} 件あります。")
+        print("    自分のIDと鍵を埋めるまで、その機能は動きません。")
+    else:
+        print("  ひな形のまま残っている箇所はありません。")
+
+
+if __name__ == "__main__":
+    args = set(sys.argv[1:])
+    if "--check" in args:
+        check()
+    else:
+        place("--force" in args)
+        print()
+        check()
