@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""
+line-guard — LINE の入り口が切れていたら、黙って直す。
+
+数分おきに走らせる前提。普段は何もせず、何もしなかったことも報告しない。
+直したときと、直せなかったときだけ Discord に一言送る。
+
+    line-guard              点検して、必要なら直す（普段は無言）
+    line-guard --report     問題がなくても今の状態を表示する
+    line-guard --dry-run    調べるだけで直さない
+    line-guard --check      OK/NG だけ返す（claw から呼ぶ用）
+
+見ているもの:
+  1. cloudflared のトンネルが「外から」届くか
+  2. 中継（line-webhook-proxy）が待ち受けているか
+  3. gateway が動いているか
+
+なぜプロセス監視では足りないか:
+  cloudflared はトンネルが死んでもプロセスは生き続け、ログも吐き続ける。
+  launchctl から見ると完全に正常に見えるまま、外からは届かなくなる。
+  実際にこれで10時間気づかなかった。
+
+なぜ「LINEから届かない」だけでトンネルを張り直してはいけないか:
+  LINE の API に届かない理由は2つある。トンネルが死んでいるか、
+  このMac自身が外に出られないか。後者のときに張り直すと、生きている
+  トンネルを壊してURLだけ変えてしまい、傷が広がる。
+  実際に 2026-08-29、ネットが9時間切れている間に78回張り直して
+  生きたトンネルを潰し続けた。だから先に「外に出られるか」を見る。
+
+なぜ自分で curl して確かめてはいけないか:
+  この回線の DNS は *.trycloudflare.com を NXDOMAIN で返す（1.1.1.1 なら引ける）。
+  つまり「自分から自分のトンネルが見えない」のが平常運転で、
+  ローカルから叩く判定は必ず「切れている」と誤診する。実際に誤診して
+  無駄にトンネルを張り直し、URLだけ変えてしまった。
+  正しい判定は LINE 自身に叩いてもらうこと（webhook/test API）。
+
+トンネルを入れ直すと URL が変わるが、line-webhook-sync が60秒以内に
+LINE 側の登録を書き換えるので、こちらは待つだけでよい。
+"""
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+TUNNEL_LOG = "/tmp/cloudflared-line.log"
+SYNC_LOG = "/tmp/line-webhook-sync.log"
+LINE_API = "https://api.line.me/v2/bot/channel/webhook"
+GUARD_LOG = os.path.expanduser("~/.openclaw/logs/line-guard.log")
+STATE_FILE = os.path.expanduser("~/.openclaw/line-guard-state.json")
+PULSE_DIR = os.path.expanduser("~/.openclaw/pulse")
+
+# 外に出られるかを確かめる相手。名前ではなく数字で書く（DNSが死んでいても試せる）。
+PROBE_HOSTS = [("1.1.1.1", 443), ("8.8.8.8", 443), ("9.9.9.9", 443)]
+
+TS_BIN = "/opt/homebrew/bin/tailscale"
+TUNNEL_PLIST = os.path.expanduser("~/Library/LaunchAgents/ai.openclaw.line-tunnel.plist")
+
+TUNNEL_LABEL = "ai.openclaw.line-tunnel"
+PROXY_LABEL = "ai.openclaw.line-proxy"
+SYNC_LABEL = "ai.openclaw.line-sync"
+
+PROXY_PORT = 18899
+GATEWAY_PORT = 18789
+
+URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+
+def beat(name):
+    """「今回ちゃんと走り切った」という跡を残す。watchdog がこれを見る。
+
+    ここが無いあいだ、line-guard を見張る者は誰もいなかった。
+    LINE の入り口を守っているのはこれ1つなので、これが黙ると
+    「入り口が切れているのに、切れたことに誰も気づかない」状態になる。
+
+    心拍のコードは model-guard / watchdog にも同じものがある。
+    **わざと共有していない。**共通の部品にすると、そこが壊れたとき
+    見張りが揃って黙る。互いを見張る意味が消えるので、10行のために独立を捨てない。"""
+    try:
+        os.makedirs(PULSE_DIR, exist_ok=True)
+        with open(os.path.join(PULSE_DIR, f"{name}.json"), "w") as f:
+            json.dump({"at": datetime.now().isoformat(timespec="seconds")}, f)
+    except OSError:
+        pass
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(GUARD_LOG), exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(GUARD_LOG, "a") as f:
+        f.write(f"[{stamp}] {msg}\n")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def notify(text):
+    """Discord に一言送る。
+
+    宛先が分からないときは**黙って捨てず**ログに残す。
+    見張りの知らせが届かないうえ、届いていないことすら分からないのが一番困る。
+    宛先（DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID）は ~/.openclaw/.env に置く。
+    ここに直書きしないのは、この一式を公開したときに個人の部屋の番号が出るため。"""
+    tok = env_value("DISCORD_BOT_TOKEN")
+    channel = env_value("DISCORD_CHANNEL_ID")
+    if not tok or not channel:
+        log("通知先が設定されていない（DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID）: " + text)
+        print(text)
+        return
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{channel}/messages",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bot {tok}",
+                 "User-Agent": "openclaw-guards (local, 1.0)"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        log("Discord に送れなかった: " + text.splitlines()[0])
+
+
+def kickstart(label):
+    subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+                   capture_output=True)
+
+
+def port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def tunnel_url():
+    """cloudflared のログから今のトンネルURLを拾う。
+
+    このログは放っておくと数十MBになる（実測27MB）。毎回まるごと読むと
+    数分おきの点検が重くなるので、末尾だけを見る。URLは起動のたびに
+    書かれるので、末尾1MBに無ければそれは「まだURLが出ていない」と同じ。"""
+    try:
+        size = os.path.getsize(TUNNEL_LOG)
+        with open(TUNNEL_LOG, errors="ignore") as f:
+            if size > 1_000_000:
+                f.seek(size - 1_000_000)
+            found = URL_RE.findall(f.read())
+        return found[-1] if found else None
+    except OSError:
+        return None
+
+
+def funnel_mode():
+    """入り口が Tailscale Funnel に移してあるか。
+
+    移してあれば cloudflared の plist は .disabled に退避されている。
+    Funnel の URL は変わらないので、張り直しも登録し直しも要らない。"""
+    return not os.path.exists(TUNNEL_PLIST)
+
+
+def funnel_up():
+    """Funnel が中継(18899)を外に出しているか。出ていなければ出し直す。"""
+    def serving():
+        p = subprocess.run([TS_BIN, "funnel", "status"],
+                           capture_output=True, text=True, timeout=30)
+        return p.returncode == 0 and str(PROXY_PORT) in (p.stdout or "")
+    if serving():
+        return True
+    subprocess.run([TS_BIN, "funnel", "--bg", str(PROXY_PORT)],
+                   capture_output=True, timeout=60)
+    return serving()
+
+
+def internet_ok():
+    """このMacが外に出られるか。DNSを使わずに数字のIPへ直接つなぐ。
+
+    Wi-Fiが切れている・圏外・ルーターが落ちている、を見分けるための判定。
+    ここが False のときにトンネルを触っても直らないし、生きたトンネルを壊す。"""
+    for host, port in PROBE_HOSTS:
+        try:
+            with socket.create_connection((host, port), timeout=4):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def dns_ok():
+    """名前が引けるか。外には出られるのにDNSだけ死ぬことがある（実測）。"""
+    try:
+        socket.getaddrinfo("api.line.me", 443)
+        return True
+    except OSError:
+        return False
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def mark_down(cause):
+    """落ちはじめた時刻と理由を覚えておく。すでに覚えていれば触らない。"""
+    state = load_state()
+    if not state.get("down_since"):
+        state["down_since"] = datetime.now().isoformat(timespec="seconds")
+        state["cause"] = cause
+        save_state(state)
+    elif state.get("cause") != cause:
+        state["cause"] = cause
+        save_state(state)
+
+
+def mark_up():
+    """復旧したら、落ちていた時間を文章にして返す。落ちていなければ None。
+
+    ネットが切れている間は Discord にも LINE にも何も送れない。
+    だから「切れた瞬間に知らせる」は原理的に無理で、
+    代わりに「戻った瞬間に、どれだけ落ちていたかをまとめて出す」。"""
+    state = load_state()
+    since = state.get("down_since")
+    save_state({})
+    if not since:
+        return None
+    try:
+        t0 = datetime.fromisoformat(since)
+    except ValueError:
+        return None
+    mins = int((datetime.now() - t0).total_seconds()) // 60
+    if mins < 5:
+        return None
+    span = f"{mins // 60}時間{mins % 60}分" if mins >= 60 else f"{mins}分"
+    return (f"LINEの入り口が {t0.strftime('%H:%M')} から {span} 落ちていました"
+            f"（{state.get('cause', '原因不明')}）。今は復旧しています。"
+            f"\nこの間に送られたLINEは届いていません。")
+
+
+def line_token():
+    tok = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    if tok:
+        return tok
+    try:
+        for line in open(ENV_FILE):
+            if line.strip().startswith("LINE_CHANNEL_ACCESS_TOKEN="):
+                return line.strip().split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def line_api(path, method="GET", timeout=30):
+    tok = line_token()
+    if not tok:
+        return None
+    req = urllib.request.Request(
+        LINE_API + path, method=method,
+        headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except Exception:
+        return None
+
+
+def registered_url():
+    """LINE 側に登録されている URL。"""
+    d = line_api("/endpoint")
+    return d.get("endpoint") if d else None
+
+
+def tunnel_reachable(url=None, timeout=30):
+    """LINE 自身に webhook を叩いてもらう。ローカルからの curl は当てにならない。"""
+    d = line_api("/test", method="POST", timeout=timeout)
+    if not d:
+        return False
+    return bool(d.get("success")) and d.get("statusCode") == 200
+
+
+def wait_new_url(old_url, seconds=90):
+    """入れ直したあと、cloudflared が新しいURLを出すまで待つ。"""
+    for _ in range(seconds // 5):
+        time.sleep(5)
+        url = tunnel_url()
+        if url and url != old_url:
+            return url
+    return None
+
+
+def sync_caught_up(url, seconds=90):
+    """line-webhook-sync が新URLをLINEに登録したかをログで確かめる。"""
+    key = url.replace("https://", "").split(".")[0]
+    for _ in range(seconds // 5):
+        try:
+            with open(SYNC_LOG, errors="ignore") as f:
+                if key in f.read():
+                    return True
+        except OSError:
+            pass
+        time.sleep(5)
+    return False
+
+
+def main():
+    if "--check" in sys.argv:
+        ok = internet_ok() and dns_ok() and tunnel_reachable()
+        print("OK" if ok else "NG")
+        return 0 if ok else 1
+
+    report = "--report" in sys.argv
+    dry = "--dry-run" in sys.argv
+    fixed = []
+    failed = []
+
+    # 1. gateway（これが無いと直しても意味がない）
+    if not port_open(GATEWAY_PORT):
+        if dry:
+            failed.append("gateway が止まっている")
+        else:
+            log("gateway が止まっていたので起こす")
+            subprocess.run(["openclaw", "daemon", "start"], capture_output=True)
+            time.sleep(10)
+            if port_open(GATEWAY_PORT):
+                fixed.append("gateway を起こした")
+            else:
+                failed.append("gateway を起こせなかった")
+
+    # 2. 中継
+    if not port_open(PROXY_PORT):
+        if dry:
+            failed.append("中継が待ち受けていない")
+        else:
+            log("中継が落ちていたので入れ直す")
+            kickstart(PROXY_LABEL)
+            time.sleep(5)
+            if port_open(PROXY_PORT):
+                fixed.append("中継を入れ直した")
+            else:
+                failed.append("中継が上がらない")
+
+    # 3. 外に出られるか。トンネルより先に、必ずこれを見る。
+    #    ここが駄目なときに張り直しても直らないうえ、生きているトンネルを
+    #    壊してURLだけ変えてしまう。ネットが戻るまで、何もしないのが正解。
+    net_down = None
+    if not internet_ok():
+        net_down = "このMacがネットにつながっていなかった"
+    elif not dns_ok():
+        net_down = "名前解決(DNS)ができなかった"
+
+    if net_down:
+        mark_down(net_down)
+        log(f"{net_down}。戻るまでトンネルは触らない")
+        if report:
+            print("LINE の入り口の状態")
+            print(f"  gateway : {'OK' if port_open(GATEWAY_PORT) else '止まっている'}")
+            print(f"  中継    : {'OK' if port_open(PROXY_PORT) else '待ち受けていない'}")
+            print(f"  外の回線: {net_down}")
+            print(f"  URL     : {tunnel_url()}（LINE側の登録は確認できない）")
+            return 1
+        # 知らせようにも通知は同じ回線を通る。ログにだけ残して黙る。
+        return 1
+
+    # 4. トンネル（本命）
+    url = tunnel_url()
+    ok = tunnel_reachable(url)
+
+    if not ok and not dry and funnel_mode():
+        # Funnel は URL が変わらない。やることは「出し直す」だけで、
+        # 登録の書き換えも新URLの待ち受けも要らない。
+        log(f"LINEから届かない（登録: {registered_url()}）。Funnel を出し直す")
+        if not funnel_up():
+            failed.append("Funnel を出し直せなかった")
+            log("復旧できず: Funnel が上がらない")
+        elif tunnel_reachable():
+            fixed.append("LINEの入り口(Funnel)を出し直した")
+            log("復旧: Funnel を出し直した")
+        else:
+            failed.append("Funnel は上がったがLINEからまだ届かない")
+            log("復旧できず: 出し直してもLINEから届かない")
+    elif not ok and not dry:
+        log(f"LINEから届かない（登録: {registered_url()}）。トンネルを入れ直す")
+        kickstart(TUNNEL_LABEL)
+        new = wait_new_url(url)
+        if not new:
+            failed.append("トンネルを張り直せなかった")
+            log("復旧できず: 新しいURLが出ない")
+        elif not sync_caught_up(new):
+            failed.append(f"新URL({new})がLINE側に反映されない")
+            log("復旧できず: LINEへの登録が進まない")
+        elif tunnel_reachable():
+            fixed.append(f"LINEの入り口を張り直した → {new}")
+            log(f"復旧: {new}")
+        else:
+            failed.append("張り直したがLINEからまだ届かない")
+            log("復旧できず: 張り直し後もLINEから届かない")
+    elif not ok and dry:
+        failed.append(f"LINEから届かない（登録: {registered_url()}）")
+
+    # 落ちていた記録をつける／消す。戻ったときだけ、落ちていた長さを知らせる。
+    healthy = ok or any(("張り直した" in f or "出し直した" in f) for f in fixed)
+    back = mark_up() if healthy else None
+    if not healthy:
+        mark_down("LINEの入り口(トンネル)が切れていた")
+
+    if report:
+        print("LINE の入り口の状態")
+        print(f"  gateway : {'OK' if port_open(GATEWAY_PORT) else '止まっている'}")
+        print(f"  中継    : {'OK' if port_open(PROXY_PORT) else '待ち受けていない'}")
+        print(f"  外の回線: OK")
+        print(f"  入り口  : {'OK' if healthy else 'LINEから届かない'}")
+        print(f"  URL     : {registered_url() or tunnel_url()}")
+        if back:
+            print("  " + back.splitlines()[0])
+        if fixed:
+            print("  直したもの: " + " / ".join(fixed))
+        if failed:
+            print("  直せなかったもの: " + " / ".join(failed))
+        return 0
+
+    # 普段は黙る。動いたときだけ知らせる。
+    if back:
+        tail = ("\n" + "\n".join(f"・{f}" for f in fixed)) if fixed else ""
+        notify("🔧 " + back + tail)
+    elif fixed and not failed:
+        notify("🔧 LINEの入り口が切れていたので直しました。\n" + "\n".join(f"・{f}" for f in fixed))
+    elif failed:
+        notify("⚠️ LINEの入り口が切れています。自動では直せませんでした。\n"
+               + "\n".join(f"・{f}" for f in failed)
+               + "\n`claw status` と /tmp/cloudflared-line.log を確認してください。")
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    code = main()
+    # 走り切ったときだけ残す。途中で落ちたら心拍は古いままになり、
+    # watchdog がそれを見て蹴り直す。
+    beat("line-guard")
+    sys.exit(code)

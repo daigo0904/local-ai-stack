@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+model-guard — 頭脳（ollama）が「立っているのに答えない」状態を見つけて直す。
+
+数分おきに走らせる前提。普段は何もせず、何もしなかったことも報告しない。
+直したときと、直せなかったときだけ Discord に一言送る。
+
+    model-guard              点検して、必要なら直す（普段は無言）
+    model-guard --report     問題がなくても今の状態を表示する
+    model-guard --dry-run    調べるだけで直さない
+    model-guard --check      OK/NG だけ返す（claw や qwc から呼ぶ用）
+
+なぜプロセス監視では足りないか:
+  2026-08-30、ollama は動いていて /api/tags も即答するのに、
+  /api/chat が3回続けて永久に返らなくなった。ollama ps は
+  「17GB・100% GPU・Forever」と、どこも異常が無いように見えていた。
+  待っている側（qwc）は CPU 0% のまま黙って止まり、
+  こちらから見ると「考え込んでいる」のと区別がつかなかった。
+  立っているかではなく、**答えられるか**を確かめないと分からない。
+
+  line-guard が cloudflared について書いているのと同じ話で、
+  この家のシステムはどれも「落ちる」のではなく「黙る」形で壊れる。
+
+なぜ答えないだけですぐ再起動してはいけないか:
+  1. gemma4:26b は冷えていると読み込みだけで36秒かかる（実測）。
+     1回の遅さで殺すと、正常な立ち上がりを毎回潰すことになる。
+  2. ollama は同時1件でしか処理しない（llama-server が -np 1 で起動している）。
+     誰かが長い依頼を投げていれば、点検はその後ろで待たされる。
+     これを「固まった」と誤診して殺すと、動いていた仕事を壊す。
+
+  そこで、答えが返らなかったときは llama-server が仕事をしているかを見る。
+  実測では、生成中は CPU 7〜84%、待機中はちょうど 0.0% だった。
+  答えが返らない**かつ**誰も働いていない、が「固まった」の形である。
+
+なぜ点検で keep_alive を無期限にするのか:
+  このMacは「モデルを常駐させたままにする」運用にしてある。
+  実測で、冷えた状態は36秒、温まっていれば1.7秒で、差が20倍あるため。
+  点検はどのみち1トークン生成させるので、そのついでに温め直す役も持たせる。
+"""
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+CONFIG_FILE = os.path.expanduser("~/.openclaw/openclaw.json")
+GUARD_LOG = os.path.expanduser("~/.openclaw/logs/model-guard.log")
+STATE_FILE = os.path.expanduser("~/.openclaw/model-guard-state.json")
+PULSE_DIR = os.path.expanduser("~/.openclaw/pulse")
+LOCK_FILE = os.path.expanduser("~/.openclaw/model-guard.lock")
+
+WATCHDOG_LABEL = "ai.openclaw.watchdog"
+# watchdog は3分おき。3回ぶん見送ってもまだ余裕がある長さにする。
+WATCHDOG_STALE = 700
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+OLLAMA_LABEL = "homebrew.mxcl.ollama"
+FALLBACK_MODEL = "gemma4:26b"
+
+# 冷えた状態の読み込みが36秒。その倍以上を待ってから「返らない」と判断する。
+# 環境変数で短くできるのは、復旧の段取りを試すため（本番では触らない）。
+PROBE_TIMEOUT = int(os.environ.get("MODEL_GUARD_TIMEOUT", "90"))
+# 生成中かどうかの境目。実測では待機がちょうど 0.0%、生成の終わりぎわで 6.8% だった。
+BUSY_CPU = 3.0
+
+# 何回続けてダメだったら、どこまで手を出すか。
+# 2分おきに走る前提なので、4分でモデルの積み直し、6分で ollama ごと入れ直しになる。
+KILL_RUNNER_AFTER = 2
+RESTART_OLLAMA_AFTER = 3
+GIVE_UP_AFTER = 5
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(GUARD_LOG), exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(GUARD_LOG, "a") as f:
+        f.write(f"[{stamp}] {msg}\n")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def notify(text):
+    """Discord に一言送る。
+
+    宛先が分からないときは**黙って捨てず**ログに残す。
+    見張りの知らせが届かないうえ、届いていないことすら分からないのが一番困る。
+    宛先（DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID）は ~/.openclaw/.env に置く。
+    ここに直書きしないのは、この一式を公開したときに個人の部屋の番号が出るため。"""
+    tok = env_value("DISCORD_BOT_TOKEN")
+    channel = env_value("DISCORD_CHANNEL_ID")
+    if not tok or not channel:
+        log("通知先が設定されていない（DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID）: " + text)
+        print(text)
+        return
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{channel}/messages",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bot {tok}",
+                 "User-Agent": "openclaw-guards (local, 1.0)"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        log("Discord に送れなかった: " + text.splitlines()[0])
+
+
+def default_model():
+    """ふだん使っているモデルを設定から拾う。設定を変えたら点検も勝手に追いかける。"""
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        name = cfg["agents"]["defaults"]["model"]["primary"]
+        # "ollama/gemma4:26b" のように前置きが付く
+        return name.split("/", 1)[1] if "/" in name else name
+    except (OSError, ValueError, KeyError, IndexError):
+        return FALLBACK_MODEL
+
+
+def runner_pids():
+    out = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True, text=True)
+    return [int(p) for p in out.stdout.split() if p.isdigit()]
+
+
+def runner_busy():
+    """モデルを走らせている側が、いま仕事をしているか。
+
+    誰かの長い依頼を処理している最中と、固まっているのを分けるための判定。
+    片方でも働いていれば「働いている」とみなす（殺さない側に倒す）。"""
+    for pid in runner_pids():
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "%cpu="],
+                             capture_output=True, text=True)
+        try:
+            if float(out.stdout.strip()) >= BUSY_CPU:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def alive():
+    """入り口が開いているか。開いていても答えるとは限らない（今回の件がそれ）。"""
+    try:
+        urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5).read()
+        return True
+    except Exception:
+        return False
+
+
+def probe(model):
+    """本当に1トークン返せるか。返せた秒数か、返せなければ None。
+
+    ついでに常駐させ直す（keep_alive: -1）。"""
+    body = json.dumps({
+        "model": model,
+        "stream": False,
+        "keep_alive": -1,
+        "options": {"num_predict": 1},
+        "messages": [{"role": "user", "content": "ok"}],
+    }).encode()
+    req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=body,
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.time()
+    try:
+        raw = urllib.request.urlopen(req, timeout=PROBE_TIMEOUT).read()
+        json.loads(raw)
+        return time.time() - t0
+    except Exception:
+        return None
+
+
+def kill_runner():
+    """モデルを走らせている側だけ落とす。ollama 本体は生かしたまま積み直させる。"""
+    pids = runner_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+    return len(pids)
+
+
+def restart_ollama():
+    subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{OLLAMA_LABEL}"],
+                   capture_output=True)
+
+
+# 心拍のやりとり。watchdog 側にも同じものを置いてある。
+#
+# **わざと共有していない。**共通の部品にすると、そこが壊れたとき
+# 2つの見張りが同時に黙る。互いを見張る意味が無くなるので、
+# 10行のために独立を捨てない。
+def beat(name):
+    try:
+        os.makedirs(PULSE_DIR, exist_ok=True)
+        with open(os.path.join(PULSE_DIR, f"{name}.json"), "w") as f:
+            json.dump({"at": datetime.now().isoformat(timespec="seconds")}, f)
+    except OSError:
+        pass
+
+
+def pulse_age(name):
+    """相手が最後に走り切ってから何秒たったか。一度も走っていなければ None。"""
+    try:
+        with open(os.path.join(PULSE_DIR, f"{name}.json")) as f:
+            at = datetime.fromisoformat(json.load(f)["at"])
+        return (datetime.now() - at).total_seconds()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def check_watchdog(state, dry):
+    """こちらを見張っている側が黙っていないか。黙っていれば蹴る。
+
+    片方向だと、見張りが1つ減ったことに誰も気づけない。
+    2つが互いを見て、はじめて「どちらか一方の死」までは拾えるようになる。"""
+    age = pulse_age("watchdog")
+    if age is not None and age <= WATCHDOG_STALE:
+        state.pop("wd_told", None)
+        return None
+    how = "一度も走っていない" if age is None else f"{int(age // 60)}分止まっている"
+    if dry:
+        return how
+    subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{WATCHDOG_LABEL}"],
+                   capture_output=True)
+    log(f"watchdog が{how} → 蹴った")
+    if not state.get("wd_told"):
+        notify(f"見張り（watchdog）が{how}ので蹴り直しました。")
+        state["wd_told"] = True
+    return how
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def describe_span(since):
+    try:
+        t0 = datetime.fromisoformat(since)
+    except (ValueError, TypeError):
+        return None, None
+    mins = int((datetime.now() - t0).total_seconds()) // 60
+    span = f"{mins // 60}時間{mins % 60}分" if mins >= 60 else f"{mins}分"
+    return t0, span
+
+
+def hold_lock():
+    """同時に2つ走らないようにする。取れなければ None。
+
+    点検そのものに最大90秒かかるので、ollama が重い日は次の回に食い込む。
+    2つが同時に「連続3回」と数えると、入れ直しを重ねて傷を広げる。"""
+    try:
+        f = open(LOCK_FILE, "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except (OSError, BlockingIOError):
+        return None
+
+
+def main():
+    args = set(sys.argv[1:])
+    dry = "--dry-run" in args
+
+    if not dry and "--report" not in args and "--check" not in args:
+        if hold_lock() is None:
+            return 0
+
+    model = default_model()
+    state = load_state()
+    fails = int(state.get("fails", 0))
+
+    # 見張り合いは先に済ませる。こちらの点検は最大90秒かかるので、
+    # 後ろに置くと ollama が重い日に相手の死を見つけるのが遅れる。
+    watchdog_note = check_watchdog(state, dry)
+
+    took = probe(model)
+
+    if took is not None:
+        # 直った、あるいはずっと元気だった。
+        if fails:
+            t0, span = describe_span(state.get("down_since"))
+            log(f"復旧 ({model}, {took:.1f}s, 連続失敗 {fails} 回)")
+            if t0 and (datetime.now() - t0).total_seconds() >= 180:
+                notify(f"ローカルのモデルが {t0.strftime('%H:%M')} から {span} 応答しませんでした。"
+                       f"いま復旧しています（{model}・{took:.1f}秒で応答）。"
+                       f"\nこの間に投げた依頼は返っていないはずです。")
+        state.update({"last_ok": datetime.now().isoformat(timespec="seconds"),
+                      "last_ok_seconds": round(took, 1), "model": model, "fails": 0})
+        state.pop("down_since", None)
+        state.pop("cause", None)
+        save_state(state)
+        beat("model-guard")
+        if "--check" in args:
+            print(f"OK {model} {took:.1f}s")
+        elif "--report" in args:
+            print(f"正常  {model} が {took:.1f} 秒で応答  （常駐: {'あり' if alive() else 'なし'}）")
+            print(f"watchdog: {watchdog_note or '走っている'}")
+        return 0
+
+    # ここから下は「1トークンも返ってこなかった」場合。
+    fails += 1
+    busy = runner_busy()
+    reachable = alive()
+    cause = ("入り口が閉じている" if not reachable
+             else "誰かの依頼を処理中" if busy else "立っているが答えない")
+
+    state["fails"] = fails
+    state.setdefault("down_since", datetime.now().isoformat(timespec="seconds"))
+    state["cause"] = cause
+    save_state(state)
+    # 心拍は、ollama が答えなくても残す。
+    # last_ok は「ollama が答えた」記録なので、落ちている間は古いまま止まる。
+    # それを「見張りが死んだ」と取り違えると、直す相手を間違える。
+    beat("model-guard")
+    log(f"応答なし ({model}, {fails}回目, {cause})")
+
+    if "--check" in args:
+        print(f"NG {model} {cause}")
+    elif "--report" in args:
+        print(f"応答なし  {model}  {cause}  （連続 {fails} 回）")
+
+    # 働いている最中なら、待つ。動いている仕事を壊すほうが損が大きい。
+    if busy:
+        return 1
+    if dry:
+        print(f"[dry-run] {fails} 回目・{cause} → ここで手を出すところ")
+        return 1
+
+    if fails == GIVE_UP_AFTER:
+        notify(f"ローカルのモデル（{model}）が {GIVE_UP_AFTER} 回続けて応答しません。"
+               f"入れ直しても戻らないので、手で見てください。"
+               f"\n  ollama ps / tail ~/.openclaw/logs/model-guard.log")
+        log("直せなかったので知らせた")
+    elif fails >= RESTART_OLLAMA_AFTER:
+        restart_ollama()
+        log("ollama ごと入れ直した")
+    elif fails >= KILL_RUNNER_AFTER:
+        n = kill_runner()
+        log(f"モデルを走らせている側を落とした ({n} 件)")
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

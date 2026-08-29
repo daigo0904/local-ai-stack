@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.openclaw.model-guard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/bin/model-guard</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.openclaw/logs/model-guard.out</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.openclaw/logs/model-guard.err</string>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+</dict>
+</plist>
