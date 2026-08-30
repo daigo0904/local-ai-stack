@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""
+claw — OpenClaw をターミナルから立ち上げる。
+
+    claw            立ち上げる（もう動いていれば何もしない）
+    claw status     今どうなっているか見る
+    claw stop       止める
+    claw restart    止めてから立ち上げ直す
+    claw log        ログを流し見る（Ctrl-C で抜ける）
+    claw chat       ターミナルでそのまま話す
+    claw ui         ブラウザの管理画面を開く
+    claw fix        LINE の入り口を点検して直す
+
+立ち上げるもの:
+  ollama       … 頭脳。設定で選んだモデルを動かす。落ちていれば起こす
+  gateway      … 本体。Discord と LINE の受け口はここが持っている
+  LINE の3つ   … トンネル / 受け口 / URL同期。落ちていれば起こす
+
+gateway は launchd 登録済みなので、本来はログインすると勝手に上がる。
+このコマンドは「上がっていないとき」と「上がったか確かめたいとき」用。
+"""
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+GATEWAY_PORT = 18789
+OLLAMA_URL = "http://127.0.0.1:11434/api/tags"
+GATEWAY_LOG = os.path.expanduser("~/Library/Logs/openclaw/gateway.log")
+CONFIG = os.path.expanduser("~/.openclaw/openclaw.json")
+TUNNEL_LOG = "/tmp/cloudflared-line.log"
+LAUNCH_AGENTS = os.path.expanduser("~/Library/LaunchAgents")
+
+# LINE を外から使うための常駐。gateway とは別プロセスで動いている。
+LINE_SERVICES = [
+    ("ai.openclaw.line-tunnel", "トンネル"),
+    ("ai.openclaw.line-proxy", "受け口"),
+    ("ai.openclaw.line-sync", "URL同期"),
+]
+
+# 見張りたち。名前・表示名・心拍がこれより古ければ黙っているとみなす秒数。
+# それぞれ2分・3分・5分おきに走るので、3回ぶん見送っても余裕がある長さにしてある。
+GUARDS = [
+    ("model-guard", "頭脳（ollama）", 400),
+    ("watchdog", "本体と見張り", 700),
+    ("line-guard", "LINEの入り口", 1100),
+    # qwc は常駐しないので1日1回でよい。丸1日以上あいたら止まっているとみなす。
+    ("qwc-guard", "コードを書く側", 30 * 3600),
+]
+PULSE_DIR = os.path.expanduser("~/.openclaw/pulse")
+
+OK = "\033[32m●\033[0m"
+NG = "\033[31m●\033[0m"
+
+
+def say(mark, label, detail=""):
+    print(f"  {mark} {label}" + (f"  {detail}" if detail else ""))
+
+
+def pulse_age(name):
+    """見張りが最後に走り切ってから何秒たったか。一度も走っていなければ None。
+
+    ここは心拍を読むだけで、点検そのものはしない。
+    claw status は毎日打つものなので、ollama に問い合わせて数秒待たせない。
+    実際に確かめたいときは model-guard --report / watchdog --report を使う。"""
+    try:
+        with open(os.path.join(PULSE_DIR, f"{name}.json")) as f:
+            at = datetime.fromisoformat(json.load(f)["at"])
+        return (datetime.now() - at).total_seconds()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def run(args, quiet=True):
+    """コマンドを実行して (成功したか, 出力) を返す。"""
+    try:
+        p = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return False, str(e)
+    out = (p.stdout + p.stderr).strip()
+    if not quiet and out:
+        print(out)
+    return p.returncode == 0, out
+
+
+# ---------------- 状態を見る ----------------
+
+
+def current_model():
+    """設定に書いてある「今使うモデル」を読む。設定を変えても表示がずれないように。"""
+    try:
+        with open(CONFIG) as f:
+            d = json.load(f)
+        name = d["agents"]["defaults"]["model"]["primary"]
+        return name.split("/", 1)[-1]  # "ollama/gemma4:26b" -> "gemma4:26b"
+    except Exception:
+        return "?"
+
+
+def tunnel_url():
+    """cloudflared のログから今のトンネルURLを拾う。"""
+    try:
+        with open(TUNNEL_LOG, errors="ignore") as f:
+            found = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", f.read())
+        return found[-1] if found else None
+    except OSError:
+        return None
+
+
+def tunnel_ok():
+    """LINE の入り口が生きているか。判定は line-guard に任せる。
+
+    自分で curl してはいけない: この回線の DNS は *.trycloudflare.com を
+    引けないので、生きていても必ず「切れている」と出る。
+    line-guard は LINE 本人に webhook を叩いてもらって判定する。
+
+    返り値: (生きているか, 説明)
+    """
+    ok, out = run(["line-guard", "--check"])
+    if ok and out.strip() == "OK":
+        return True, ""
+    return False, "LINEから届いていない（claw fix で直す）"
+
+
+def ollama_up():
+    try:
+        with urllib.request.urlopen(OLLAMA_URL, timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def gateway_up():
+    """ポートが開いているか。openclaw health より速くて、落ちていても待たされない。"""
+    try:
+        with socket.create_connection(("127.0.0.1", GATEWAY_PORT), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def launchd_pids():
+    """launchctl list を { ラベル: PID または None } にする。"""
+    ok, out = run(["launchctl", "list"])
+    pids = {}
+    if not ok:
+        return pids
+    for line in out.splitlines():
+        cols = line.split("\t")
+        if len(cols) < 3:
+            continue
+        pid, label = cols[0], cols[2]
+        pids[label] = None if pid == "-" else pid
+    return pids
+
+
+def wait_for(check, seconds, note):
+    """check() が True になるまで待つ。待っている間は点を打つ。"""
+    for i in range(seconds):
+        if check():
+            if i:
+                print()
+            return True
+        if i == 0:
+            print(f"  … {note}", end="", flush=True)
+        print(".", end="", flush=True)
+        time.sleep(1)
+    print()
+    return False
+
+
+# ---------------- 起こす ----------------
+
+
+def start_ollama():
+    if ollama_up():
+        return True
+    print("  … ollama を起こす")
+    run(["brew", "services", "start", "ollama"])
+    return wait_for(ollama_up, 30, "ollama の返事を待つ")
+
+
+def start_gateway():
+    if gateway_up():
+        return True
+    ok, out = run(["openclaw", "daemon", "start"])
+    if not ok:
+        print("  ! gateway を起こせなかった")
+        if out:
+            print("    " + out.replace("\n", "\n    "))
+        return False
+    return wait_for(gateway_up, 60, "gateway の起動を待つ")
+
+
+def start_line():
+    """LINE の常駐を、落ちているものだけ起こす。"""
+    pids = launchd_pids()
+    for label, name in LINE_SERVICES:
+        if pids.get(label):
+            continue
+        plist = os.path.join(LAUNCH_AGENTS, f"{label}.plist")
+        if not os.path.exists(plist):
+            continue
+        target = f"gui/{os.getuid()}/{label}"
+        if label in pids:
+            run(["launchctl", "kickstart", "-k", target])
+        else:
+            run(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist])
+        print(f"  … LINE の{name}を起こした")
+
+
+def repair_tunnel():
+    """LINE の入り口が切れていれば直す。中身は line-guard に任せる。"""
+    reachable, _ = tunnel_ok()
+    if reachable:
+        return
+    print("  … LINE の入り口が切れているので直す（1〜2分かかる）")
+    subprocess.run(["line-guard", "--report"])
+
+
+def cmd_fix():
+    """LINE まわりを点検して直す。"""
+    return subprocess.run(["line-guard", "--report"]).returncode
+
+
+# ---------------- 表示 ----------------
+
+
+def health_lines():
+    """openclaw health の頭のほう（Discord / LINE / 応答の速さ）だけ拾う。"""
+    ok, out = run(["openclaw", "health"])
+    if not ok:
+        return []
+    keep = []
+    for line in out.splitlines():
+        if line.startswith(("Discord:", "LINE:", "Gateway event loop:")):
+            keep.append(line.strip())
+    return keep
+
+
+def show_status():
+    print("OpenClaw の状態")
+
+    say(OK if ollama_up() else NG, f"ollama    頭脳（{current_model()}）")
+
+    up = gateway_up()
+    say(OK if up else NG, f"gateway   本体（127.0.0.1:{GATEWAY_PORT}）")
+
+    pids = launchd_pids()
+    for label, name in LINE_SERVICES:
+        alive = bool(pids.get(label))
+        say(OK if alive else NG, f"LINE      {name}")
+
+    # プロセスが生きていてもトンネルが切れていることがある（実際に10時間気づかなかった）
+    reachable, note = tunnel_ok()
+    say(OK if reachable else NG, "LINE      外からの入り口", note if not reachable else "")
+
+    # 見張りたち。
+    #
+    # ここに出しているのは、3つが別々のプロセスで別々の時計で動いているから。
+    # 1つにまとめると、そのファイルのバグ1つで全部が同時に黙り、
+    # 互いを見張る意味が消える。散らばって見えるのは、そのための代償である。
+    print()
+    for name, label, limit in GUARDS:
+        age = pulse_age(name)
+        if age is None:
+            say(NG, f"見張り    {label}", "動いていない")
+        elif age > limit:
+            say(NG, f"見張り    {label}", f"{int(age // 60)}分止まっている")
+        else:
+            say(OK, f"見張り    {label}", f"{int(age)}秒前")
+
+    if up:
+        print()
+        for line in health_lines():
+            print(f"    {line}")
+        print(f"\n  管理画面: http://127.0.0.1:{GATEWAY_PORT}/  （claw ui で開く）")
+        print("  話す:     claw chat")
+    else:
+        print("\n  立ち上げる: claw")
+
+
+# ---------------- 各コマンド ----------------
+
+
+def cmd_start():
+    if gateway_up() and ollama_up():
+        print("もう動いている。")
+        print()
+        show_status()
+        return 0
+
+    print("OpenClaw を立ち上げる")
+    if not start_ollama():
+        print("  ! ollama が上がらなかった。頭脳が無いので止まる。")
+        return 1
+    if not start_gateway():
+        print("  ! gateway が上がらなかった。claw log でログを見る。")
+        return 1
+    start_line()
+    repair_tunnel()
+    print()
+    show_status()
+    return 0
+
+
+def cmd_stop():
+    ok, out = run(["openclaw", "daemon", "stop"])
+    print("gateway を止めた。" if ok else f"止められなかった: {out}")
+    print("（ollama と LINE の常駐はそのまま。まるごと止めるなら claw stop --all）")
+    if "--all" in sys.argv:
+        for label, name in LINE_SERVICES:
+            run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"])
+            print(f"  LINE の{name}も止めた")
+        run(["brew", "services", "stop", "ollama"])
+        print("  ollama も止めた")
+    return 0 if ok else 1
+
+
+def cmd_restart():
+    run(["openclaw", "daemon", "stop"])
+    time.sleep(2)
+    return cmd_start()
+
+
+def cmd_log():
+    if not os.path.exists(GATEWAY_LOG):
+        print("まだログが無い。")
+        return 1
+    print(f"{GATEWAY_LOG}（Ctrl-C で抜ける）\n")
+    try:
+        subprocess.run(["tail", "-n", "40", "-f", GATEWAY_LOG])
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_chat():
+    if not gateway_up():
+        print("gateway が動いていないので、先に立ち上げる。")
+        if cmd_start() != 0:
+            return 1
+        print()
+    # Discord や LINE と同じ記憶を使う。--local にすると別の頭になるので使わない。
+    return subprocess.run(["openclaw", "tui"]).returncode
+
+
+def cmd_ui():
+    if not gateway_up():
+        print("gateway が動いていないので、先に立ち上げる。")
+        if cmd_start() != 0:
+            return 1
+    return subprocess.run(["openclaw", "dashboard"]).returncode
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "start"
+    table = {
+        "start": cmd_start,
+        "up": cmd_start,
+        "status": show_status,
+        "stop": cmd_stop,
+        "down": cmd_stop,
+        "restart": cmd_restart,
+        "log": cmd_log,
+        "logs": cmd_log,
+        "chat": cmd_chat,
+        "tui": cmd_chat,
+        "ui": cmd_ui,
+        "fix": cmd_fix,
+        "dashboard": cmd_ui,
+    }
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if cmd not in table:
+        print(f"知らないコマンド: {cmd}\n")
+        print(__doc__.strip())
+        return 1
+    return table[cmd]() or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

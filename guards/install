@@ -27,8 +27,9 @@ BIN = os.path.join(HOME, "bin")
 AGENTS = os.path.join(HOME, "Library", "LaunchAgents")
 ENV_FILE = os.path.join(HOME, ".openclaw", ".env")
 
-GUARDS = ["model-guard", "watchdog", "line-guard", "claw"]
-LABELS = ["ai.openclaw.model-guard", "ai.openclaw.watchdog", "ai.openclaw.line-guard"]
+GUARDS = ["model-guard", "watchdog", "line-guard", "qwc-guard", "claw"]
+LABELS = ["ai.openclaw.model-guard", "ai.openclaw.watchdog", "ai.openclaw.line-guard",
+          "ai.openclaw.qwc-guard"]
 
 # 知らせ先。無くても見張りは動くが、直したことが誰にも届かなくなる。
 NEEDED_KEYS = ["DISCORD_BOT_TOKEN", "DISCORD_CHANNEL_ID"]
