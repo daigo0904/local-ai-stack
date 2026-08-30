@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""
+guard-drill — 見張りが本当に働くかを、わざと壊して確かめる。
+
+    guard-drill              安全な訓練だけ（サービスは止めない）
+    guard-drill --full       止まる訓練も含めて全部
+    guard-drill --list       何を試すか見る
+    guard-drill <名前>       1つだけ
+    guard-drill --dry-run    何をするかだけ見せる
+
+## なぜ要るか
+
+見張りは黙って壊れる。2026-08-30、watchdog は直っていないのに
+「入れ直した」とログに書いていた。launchctl kickstart が
+plist の外れた相手には効かないのに、戻り値を捨てていたためである。
+手で壊した側を試さなければ、この嘘は次の本物の障害まで見つからなかった。
+
+**黙って壊れた見張りは、健全な見張りと見た目が同じ。**
+この一式が扱っている問題が、見張り自身に返ってきている形なので、
+「動くはず」ではなく「動くことを見せろ」に切り替える。
+
+## 訓練が障害にならないための決まり
+
+1. 壊す前に、戻し方を先に決める。決められないものは訓練にしない。
+2. どの項目も、終わったら**戻ったことを確かめる**。確かめずに次へ進まない。
+3. 途中で失敗したら、そこで止めて全部戻す。残りは走らせない。
+4. 走っているあいだは印を置く。見張りの記録を後から読む人が、
+   本物の障害と訓練を取り違えないため。
+5. サービスが実際に止まる訓練は、既定では走らせない（--full のときだけ）。
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, pulse_age, PULSE_DIR, OPENCLAW  # noqa: E402
+
+G = Guard("guard-drill")
+MARK_FILE = os.path.join(OPENCLAW, "drill-in-progress")
+
+BIN = os.path.expanduser("~/bin")
+GATEWAY_PORT = 18789
+GATEWAY_PLIST = os.path.expanduser("~/Library/LaunchAgents/ai.openclaw.gateway.plist")
+
+
+# ── 小道具 ────────────────────────────────────────────────
+def width(text):
+    """画面上の幅。日本語は2文字ぶん取るので、len では桁が揃わない。"""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def pad(text, to):
+    return text + " " * max(0, to - width(text))
+
+
+def say(mark, text, detail=""):
+    print(f"  {mark} {pad(text, 24)}" + (f"  {detail}" if detail else ""), flush=True)
+
+
+OK, NG, DOT = "\033[32m●\033[0m", "\033[31m●\033[0m", "\033[90m·\033[0m"
+
+
+def run(args, timeout=120):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def port_open(port):
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def wait_until(fn, seconds, step=1.0):
+    """条件が満たされるまで待つ。戻すときに必ず使う（待たずに次へ進まない）。"""
+    end = time.time() + seconds
+    while time.time() < end:
+        if fn():
+            return True
+        time.sleep(step)
+    return fn()
+
+
+# 止める・動かすは、番号ではなく名前で送る。
+#
+# 番号を直書きしていて、macOS で一度も止められていなかった。
+# macOS は SIGSTOP=17 / SIGCONT=19、Linux は SIGSTOP=19 / SIGCONT=18 と逆で、
+# Linux の 19 を「止める」のつもりで送っていたので、実際には「動かす」だった。
+# 訓練は何も壊さないまま「通った」と報告していた。
+def proc_state(pid):
+    r = run(["ps", "-p", str(pid), "-o", "state="])
+    return (r.stdout.strip() if r and r.stdout else "")
+
+
+def resume(pid, seconds=20):
+    """止めた相手を動かし直す。**状態を見て、動くまで送り続ける。**
+
+    一度送って終わりにしていたら、止まったまま「戻した」と報告していた。
+    実際にそうなり、ollama がポートだけ握って答えない状態で残った。
+    kickstart の嘘と同じ形で、確かめずに書いたのが原因である。"""
+    if not pid:
+        return True
+    end = time.time() + seconds
+    while time.time() < end:
+        st = proc_state(pid)
+        if not st:                       # もう居ない（誰かが入れ直した）
+            return True
+        if "T" not in st:                # 動いている
+            return True
+        try:
+            os.kill(int(pid), signal.SIGCONT)
+        except (OSError, ProcessLookupError):
+            return True
+        time.sleep(0.5)
+    return "T" not in proc_state(pid)
+
+
+def healthy():
+    """いま一式が本当に動いているか。訓練の後始末はここが緑になるまで終わらない。"""
+    r = run([os.path.join(BIN, "model-guard"), "--check"], timeout=300)
+    if not (r and r.stdout.startswith("OK")):
+        return False
+    return port_open(GATEWAY_PORT)
+
+
+def lock_free(guard_name):
+    """その見張りの鍵が空いているか。
+
+    相手が止まっているあいだ、定期実行の見張りは点検の時間切れ（最大90秒）
+    ずっと鍵を握る。訓練が同じ時間に呼ぶと、黙って引き返したぶんを
+    「試した」と数えてしまい、8回呼んで1回も動いていない状態になった。"""
+    import fcntl
+    try:
+        f = open(os.path.join(OPENCLAW, f"{guard_name}.lock"), "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+        return True
+    except (OSError, BlockingIOError):
+        return False
+
+
+def poke_until_noticed(guard_name, mark, args, seconds, env=None):
+    """見張りが記録を残すまで、鍵の空いた隙に呼び続ける。
+
+    記録が伸びれば、誰が呼んだぶんでもよい（定期実行が先に気づくこともある）。
+    見たいのは「この故障に見張りが気づいたか」であって、呼び出し元ではない。"""
+    end = time.time() + seconds
+    while time.time() < end:
+        if log_lines(guard_name) > mark:
+            return True
+        if lock_free(guard_name):
+            subprocess.run(args, capture_output=True, timeout=300,
+                           env=env or os.environ)
+        else:
+            time.sleep(3)
+    return log_lines(guard_name) > mark
+
+
+def log_lines(guard_name):
+    """その見張りの記録の行数。訓練の前後で比べて、気づいたかを見る。"""
+    try:
+        with open(os.path.join(OPENCLAW, "logs", f"{guard_name}.log")) as f:
+            return len(f.readlines())
+    except OSError:
+        return 0
+
+
+def noticed(guard_name, before, want):
+    """訓練のあいだに、その見張りが本当に気づいて動いたか。
+
+    **ここが訓練の本体である。**サービスが戻ったことだけを見ていると、
+    こちらが後始末で戻したぶんを「見張りが直した」と取り違える。
+    実際そうなり、見張りが1行も記録していないのに「通った」と表示した。
+
+    さらに悪いことに、gateway の合否にポートの開閉を使っていた。
+    止めたプロセスもポートは握ったままなので、必ず「開いている」と出る。
+    **この一式が存在する理由そのものを、訓練の中で間違えていた。**
+    """
+    try:
+        with open(os.path.join(OPENCLAW, "logs", f"{guard_name}.log")) as f:
+            new_lines = f.readlines()[before:]
+    except OSError:
+        return False, "記録が読めない"
+    hit = [l for l in new_lines if any(w in l for w in want)]
+    if not hit:
+        return False, "見張りが気づいた形跡がない（記録に1行も出ていない）"
+    return True, hit[-1].strip()
+
+
+def set_pulse(name, minutes_ago):
+    p = os.path.join(PULSE_DIR, f"{name}.json")
+    at = datetime.fromtimestamp(time.time() - minutes_ago * 60)
+    with open(p, "w") as f:
+        json.dump({"at": at.isoformat(timespec="seconds")}, f)
+
+
+# ── 訓練 ──────────────────────────────────────────────────
+# 返すのは (通ったか, 説明)。どの訓練も、壊した状態で return しない。
+
+def drill_pulse():
+    """心拍を巻き戻して、相互監視が相手を蹴り起こすか。"""
+    before = pulse_age("model-guard")
+    set_pulse("model-guard", 30)
+    r = run([os.path.join(BIN, "watchdog"), "--report"], timeout=180)
+    if r is None:
+        return False, "watchdog が返ってこない"
+    if "30分止まっている" not in r.stdout:
+        return False, f"止まっているのに気づかない（{r.stdout.splitlines()[0] if r.stdout else '出力なし'}）"
+    # 蹴った結果、心拍が新しくなっているはず
+    if not wait_until(lambda: (pulse_age("model-guard") or 999) < 120, 60):
+        return False, "気づいたが、蹴っても心拍が戻らない"
+    return True, f"気づいて蹴り起こした（前回は {int(before or 0)} 秒前）"
+
+
+def drill_lock():
+    """同時に2つ走らないか（二重に手を出すと、直すつもりで壊す）。"""
+    import fcntl
+    lock = os.path.join(OPENCLAW, "watchdog.lock")
+    if not wait_until(lambda: not run(["pgrep", "-f", "bin/watchdog"]).stdout.strip(), 60, 2):
+        return False, "watchdog が走り続けていて試せない"
+    f = open(lock, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False, "鍵を取れないので試せない"
+    try:
+        t0 = time.time()
+        run([os.path.join(BIN, "watchdog")], timeout=180)
+        took = time.time() - t0
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+    if took > 2:
+        return False, f"鍵が効いていない（{took:.1f}秒かけて点検した）"
+    return True, f"{took:.2f}秒で引き返した"
+
+
+def drill_guardlib():
+    """共有部品が壊れたとき、検査が気づくか。
+
+    本物は触らない。写しを壊して、検査がそれを落とせるかだけ見る。
+    ここが効かないと、共有にした代償を払っただけになる。"""
+    src = os.path.join(BIN, "guardlib.py")
+    tmp = tempfile.mkdtemp(prefix="drill-lib-")
+    try:
+        broken = os.path.join(tmp, "guardlib.py")
+        shutil.copy2(src, broken)
+        with open(broken, "a") as f:
+            f.write("\ndef beat(  # わざと壊す\n")
+        r = run([sys.executable, broken, "--selftest"], timeout=60)
+        if r is not None and r.returncode == 0:
+            return False, "壊れているのに検査が通ってしまう"
+        good = run([sys.executable, src, "--selftest"], timeout=60)
+        if good is None or good.returncode != 0:
+            return False, "本物の検査が通らない"
+        return True, "壊れた写しは落ち、本物は通る"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def drill_qwc():
+    """コードを書く側の壊れ方を、qwc-guard が見分けるか。
+
+    本物の qwc は触らない。偽物にすげ替えて試す。"""
+    tmp = tempfile.mkdtemp(prefix="drill-qwc-")
+    stubs = {
+        "起動しない": '#!/bin/sh\nexit 3\n',
+        "勝手に書き換える": '#!/bin/sh\n[ "$1" = "--version" ] && { echo "qwc 0.2.0"; exit 0; }\n'
+                            'echo "むらさきいろのかもめ"\necho x > hello.txt\nexit 0\n',
+        "読めていない": '#!/bin/sh\n[ "$1" = "--version" ] && { echo "qwc 0.2.0"; exit 0; }\n'
+                        'echo "わかりません"\nexit 0\n',
+        "ゴミを作る": '#!/bin/sh\n[ "$1" = "--version" ] && { echo "qwc 0.2.0"; exit 0; }\n'
+                      'echo "むらさきいろのかもめ"\ntouch memo.txt\nexit 0\n',
+    }
+    missed = []
+    try:
+        for label, body in stubs.items():
+            p = os.path.join(tmp, "qwc")
+            with open(p, "w") as f:
+                f.write(body)
+            os.chmod(p, 0o755)
+            env = dict(os.environ, QWC_GUARD_BIN=p)
+            r = subprocess.run([os.path.join(BIN, "qwc-guard"), "--check"],
+                               capture_output=True, text=True, timeout=300, env=env)
+            if r.returncode == 0:
+                missed.append(label)
+        if missed:
+            return False, "見逃した: " + " / ".join(missed)
+        return True, f"{len(stubs)} 通りの壊れ方を全部見分けた"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def drill_ollama():
+    """頭脳を本当に止めて、model-guard が戻すか。**しばらく返事が来なくなる。**"""
+    serve = run(["pgrep", "-f", "ollama serve"])
+    pid = serve.stdout.split()[0] if serve and serve.stdout.strip() else None
+    if not pid:
+        return False, "ollama serve が見つからない"
+    runner = run(["pgrep", "-f", "llama-server"])
+    rpid = runner.stdout.split()[0] if runner and runner.stdout.strip() else None
+
+    mark = log_lines("model-guard")
+    os.kill(int(pid), signal.SIGSTOP)
+    if rpid:
+        os.kill(int(rpid), signal.SIGSTOP)
+    try:
+        env = dict(os.environ, MODEL_GUARD_TIMEOUT="15")
+        t0 = time.time()
+        # 気づくまで（最大4分）。そのあと、手を出すところまで見届ける。
+        poke_until_noticed("model-guard", mark, [os.path.join(BIN, "model-guard")], 240, env)
+        poke_until_noticed("model-guard", log_lines("model-guard"),
+                           [os.path.join(BIN, "model-guard")], 180, env)
+        took = time.time() - t0
+    finally:
+        # 生き残っていたら必ず動かし直す。**戻ったことを見てから抜ける。**
+        for p in (rpid, pid):
+            resume(p)
+    if not wait_until(healthy, 180, 5):
+        return False, "訓練のあと頭脳が戻らない。手で見ること"
+    saw, detail = noticed("model-guard", mark, ["応答なし"])
+    if not saw:
+        return False, detail
+    fixed, _ = noticed("model-guard", mark, ["入れ直した", "落とした", "復旧"])
+    if not fixed:
+        return False, f"気づいたが手を出していない（{detail}）"
+    return True, f"{int(took)}秒で気づいて手を出した"
+
+
+def drill_gateway():
+    """受け口を黙らせて、watchdog が入れ直すか。**LINE と Discord が数秒切れる。**"""
+    pids = run(["lsof", "-nP", "-iTCP:18789", "-sTCP:LISTEN", "-t"])
+    pid = pids.stdout.split()[0] if pids and pids.stdout.strip() else None
+    if not pid:
+        return False, "gateway が見つからない"
+
+    state = os.path.join(OPENCLAW, "watchdog-state.json")
+    saved = open(state).read() if os.path.exists(state) else None
+    if os.path.exists(state):
+        os.remove(state)
+
+    mark = log_lines("watchdog")
+    os.kill(int(pid), signal.SIGSTOP)          # 立っているのに答えない状態
+    try:
+        t0 = time.time()
+        poke_until_noticed("watchdog", mark, [os.path.join(BIN, "watchdog")], 180)
+        poke_until_noticed("watchdog", log_lines("watchdog"),
+                           [os.path.join(BIN, "watchdog")], 180)
+        took = time.time() - t0
+    finally:
+        resume(pid)
+        if saved is not None:
+            with open(state, "w") as f:
+                f.write(saved)
+
+    # **ポートの開閉では判定しない。**止めたプロセスもポートは握ったままなので、
+    # 必ず「開いている」と出る。見た側が「開いているのに答えない」を扱う一式で、
+    # 訓練だけがポートを信じていた。
+    if not wait_until(healthy, 180, 5):
+        return False, "訓練のあと受け口が戻らない。手で見ること"
+    saw, detail = noticed("watchdog", mark, ["gateway が"])
+    if not saw:
+        return False, detail
+    fixed, _ = noticed("watchdog", mark, ["入れ直して戻った", "入れ直した"])
+    if not fixed:
+        return False, f"気づいたが入れ直していない（{detail}）"
+    return True, f"{int(took)}秒で気づいて入れ直した"
+
+
+DRILLS = [
+    ("pulse",    "心拍の相互監視",       drill_pulse,    False),
+    ("lock",     "二重に走らない鍵",     drill_lock,     False),
+    ("guardlib", "共有部品の検査",       drill_guardlib, False),
+    ("qwc",      "コードを書く側の故障", drill_qwc,      False),
+    ("ollama",   "頭脳を止めて復旧",     drill_ollama,   True),
+    ("gateway",  "受け口を黙らせて復旧", drill_gateway,  True),
+]
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = {a for a in sys.argv[1:] if a.startswith("-")}
+
+    if "--list" in flags:
+        print("試せるもの:\n")
+        for name, title, _, heavy in DRILLS:
+            print(f"  {name:9} {title}" + ("   ※ サービスが一時的に止まる" if heavy else ""))
+        print("\n  既定では ※ 印は走らせない。--full で全部。")
+        return 0
+
+    chosen = [d for d in DRILLS if (d[0] in args) or (not args and (not d[3] or "--full" in flags))]
+    if not chosen:
+        print("その名前の訓練はありません。--list で一覧。")
+        return 1
+
+    if "--dry-run" in flags:
+        print("走らせるもの:")
+        for name, title, _, heavy in chosen:
+            print(f"  {name:9} {title}" + ("   ※ 一時的に止まる" if heavy else ""))
+        return 0
+
+    # 訓練中の印。あとで記録を読む人が、本物の障害と取り違えないため。
+    with open(MARK_FILE, "w") as f:
+        json.dump({"at": datetime.now().isoformat(timespec="seconds"),
+                   "drills": [d[0] for d in chosen]}, f, ensure_ascii=False)
+    G.log("訓練を始めた: " + ", ".join(d[0] for d in chosen))
+
+    print(f"\n見張りの訓練（{len(chosen)} 項目）\n", flush=True)
+    results, stopped = [], False
+    try:
+        for name, title, fn, heavy in chosen:
+            print(f"  {DOT} {title} …", end="", flush=True)
+            sys.stdout.flush()
+            t0 = time.time()
+            try:
+                ok, detail = fn()
+            except Exception as e:                       # noqa: BLE001
+                ok, detail = False, f"訓練そのものが失敗した（{type(e).__name__}: {e}）"
+            print("\r\033[K", end="", flush=True)
+            say(OK if ok else NG, title, f"{detail}（{int(time.time()-t0)}秒）")
+            results.append((name, title, ok, detail))
+            G.log(f"{name}: {'通った' if ok else '落ちた'} — {detail}")
+            if not ok:
+                # 3. 途中で失敗したら、そこで止める。残りは走らせない。
+                stopped = True
+                break
+    finally:
+        try:
+            os.remove(MARK_FILE)
+        except OSError:
+            pass
+        G.beat()
+
+    # 訓練が傷を残していないかを、合否に含める。
+    #
+    # 「壊れ方を見つけられたか」だけを見ていたら、ollama を止めたまま
+    # 「2項目すべて通りました」と表示した。訓練が一番の障害要因になる、
+    # というのがまさにこれで、後始末まで見ないと合格とは呼べない。
+    print(f"  {DOT} 後始末の確認 …", end="", flush=True)
+    sys.stdout.flush()
+    left_ok = wait_until(healthy, 180, 5)
+    print("\r\033[K", end="", flush=True)
+    say(OK if left_ok else NG, "後始末の確認",
+        "傷は残っていない" if left_ok else "**訓練が壊したまま戻っていない。手で見ること**")
+    results.append(("cleanup", "後始末の確認", left_ok,
+                    "傷は残っていない" if left_ok else "壊したまま戻っていない"))
+    G.log(f"後始末: {'傷なし' if left_ok else '戻っていない'}")
+
+    bad = [r for r in results if not r[2]]
+    print()
+    if bad:
+        print(f"  {len(bad)} 項目が落ちました。" + ("残りは走らせていません。" if stopped else ""))
+        G.notify("見張りの訓練で問題が見つかりました。\n"
+                 + "\n".join(f"・{t}: {d}" for _, t, ok, d in results if not ok)
+                 + "\n見張りが黙って壊れている可能性があります。")
+    else:
+        print(f"  {len(results)} 項目すべて通りました。")
+
+    # どんな終わり方でも、いまの状態を最後に見せる（訓練が傷を残していないか）
+    #
+    # 外のコマンドは画面に直接書くので、先に自分のぶんを出し切っておく。
+    # これを忘れると、結果より先に claw status が割り込んで読めなくなる。
+    print()
+    sys.stdout.flush()
+    subprocess.run([os.path.join(BIN, "claw"), "status"])
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
