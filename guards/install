@@ -28,7 +28,7 @@ AGENTS = os.path.join(HOME, "Library", "LaunchAgents")
 ENV_FILE = os.path.join(HOME, ".openclaw", ".env")
 
 GUARDS = ["guardlib.py", "model-guard", "watchdog", "line-guard", "qwc-guard",
-          "guard-drill", "claw"]
+          "guard-drill", "config-guard", "claw"]
 LABELS = ["ai.openclaw.model-guard", "ai.openclaw.watchdog", "ai.openclaw.line-guard",
           "ai.openclaw.qwc-guard"]
 

@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+config-guard — OpenClaw の設定を、いつでも戻せる状態にしておく。
+
+    config-guard              いまの状態（普段はこれ）
+    config-guard --save       いまの設定を「動いた形」として記録する
+    config-guard --diff       動いた形から何が変わったか
+    config-guard --rollback   動いた形に戻す
+    config-guard --log        これまでの記録
+
+## なぜ要るか
+
+`openclaw.json` の控え（.bak）が9個たまっていた。手で写しを取るしかなく、
+壊しても何を変えたのか分からない状態だった。**設定を変えられるなら、
+戻せなければならない。**
+
+## 「動いた形」の意味
+
+ただ保存した設定ではない。**その設定で受け口が実際に応答したこと**を
+確かめてから印を付ける。動かない設定に戻しても意味がないので、
+確かめずに印を動かすことはしない。
+
+## 戻すときに、いまのものを捨てない
+
+戻す前に、壊れている今の設定も必ず記録してから戻す。
+「戻したら、何が悪かったのか分からなくなった」を避けるため。
+
+## ここは手元だけ
+
+どこにも push しない。鍵（.env）は追っていないが、自分を指すID
+（LINE / Discord）は実物のまま入っている。公開している設定のひな形は
+別にある（local-ai-stack の openclaw/）。
+"""
+
+import os
+import subprocess
+import sys
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, OPENCLAW  # noqa: E402
+
+G = Guard("config-guard")
+GOOD = "last-good"          # 動いた形を指す印
+BIN = os.path.expanduser("~/bin")
+
+OK, NG, WARN = "\033[32m●\033[0m", "\033[31m●\033[0m", "\033[33m●\033[0m"
+
+
+def git(*args, check=False):
+    r = subprocess.run(["git", *args], cwd=OPENCLAW, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r
+
+
+def has_repo():
+    return git("rev-parse", "--git-dir").returncode == 0
+
+
+def good_ref():
+    r = git("rev-parse", "--verify", f"refs/tags/{GOOD}")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def dirty():
+    """記録していない変更があるか。"""
+    return bool(git("status", "--porcelain").stdout.strip())
+
+
+def healthy():
+    """この設定で、受け口が本当に応答するか。
+
+    ポートの開閉では見ない。**止まったプロセスもポートは握ったまま**なので、
+    設定が壊れていても「開いている」と出てしまう。
+
+    **watchdog には聞かない。**あちらは元気なときにこちらの --save を呼ぶので、
+    ここで watchdog に聞くと互いを呼び合って止まらなくなる（実際にそうなった）。
+    見張りどうしは、判断を借りずにそれぞれが直接確かめる。"""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 18789), timeout=2):
+            pass
+    except OSError:
+        return False
+    env = dict(os.environ)
+    env["PATH"] = "/opt/homebrew/bin:" + env.get("PATH", "/usr/bin:/bin")
+    try:
+        r = subprocess.run(["/opt/homebrew/bin/openclaw", "health"],
+                           capture_output=True, text=True, timeout=30, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and "Gateway event loop" in r.stdout
+
+
+def commit(message):
+    if not dirty():
+        return None
+    git("add", "-A")
+    git("-c", "user.name=config-guard", "-c", "user.email=config-guard@local",
+        "commit", "-q", "-m", message)
+    return git("rev-parse", "--short", "HEAD").stdout.strip()
+
+
+def cmd_save(force=False):
+    """いまの設定を「動いた形」にする。動いていることを確かめてから。"""
+    if not force and not healthy():
+        print(f"  {NG} 受け口が応答しないので、印は動かしません。")
+        print("     いまの設定は動いていません。--force で無理に印を付けられますが、")
+        print("     動かない形に戻れるようになるだけです。")
+        return 1
+    c = commit(f"動いた形 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    git("tag", "-f", GOOD)
+    print(f"  {OK} いまの設定を「動いた形」として記録しました" + (f"（{c}）" if c else "（変更なし）"))
+    G.log(f"動いた形を更新: {git('rev-parse', '--short', GOOD).stdout.strip()}")
+    return 0
+
+
+def cmd_diff():
+    ref = good_ref()
+    if not ref:
+        print("  まだ「動いた形」がありません。config-guard --save で作れます。")
+        return 1
+    r = git("diff", GOOD, "--stat")
+    body = git("diff", GOOD)
+    if not r.stdout.strip() and not dirty():
+        print("  動いた形と同じです。")
+        return 0
+    print(git("diff", GOOD, "--", ".").stdout or body.stdout or "  （記録されていない変更のみ）")
+    print(git("diff", "--stat").stdout)
+    return 0
+
+
+def cmd_rollback(quiet=False):
+    """動いた形に戻す。戻す前に、いまのものも必ず残す。"""
+    ref = good_ref()
+    if not ref:
+        G.log("戻せない：動いた形がまだ無い")
+        if not quiet:
+            print(f"  {NG} 「動いた形」がまだありません。戻す先がありません。")
+        return 1
+
+    kept = commit(f"戻す前の形 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    r = git("checkout", GOOD, "--", ".")
+    if r.returncode != 0:
+        G.log(f"戻せなかった: {r.stderr.strip()}")
+        if not quiet:
+            print(f"  {NG} 戻せませんでした: {r.stderr.strip()}")
+        return 1
+
+    G.log(f"動いた形に戻した（戻す前: {kept or '変更なし'}）")
+    if not quiet:
+        print(f"  {OK} 動いた形に戻しました" + (f"（戻す前の形は {kept} に残してあります）" if kept else ""))
+    return 0
+
+
+def cmd_status():
+    if not has_repo():
+        print(f"  {NG} まだ版管理していません。")
+        return 1
+    ref = good_ref()
+    print("OpenClaw の設定")
+    if ref:
+        when = git("log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M", GOOD).stdout.strip()
+        print(f"  {OK} 動いた形  {git('rev-parse','--short',GOOD).stdout.strip()}  {when}")
+    else:
+        print(f"  {WARN} 動いた形  まだ無い（config-guard --save で作る）")
+
+    if dirty():
+        n = len(git("status", "--porcelain").stdout.strip().splitlines())
+        print(f"  {WARN} いまの設定  記録していない変更が {n} 件")
+        for line in git("status", "--porcelain").stdout.strip().splitlines():
+            print(f"        {line}")
+    else:
+        print(f"  {OK} いまの設定  記録済みのものと同じ")
+
+    n = git("rev-list", "--count", "HEAD").stdout.strip()
+    print(f"\n  記録は {n} 件。 変更を見る: config-guard --diff / 戻す: config-guard --rollback")
+    return 0
+
+
+def cmd_log():
+    print(git("log", "--format=  %h  %cd  %s", "--date=format:%Y-%m-%d %H:%M", "-20").stdout, end="")
+    ref = good_ref()
+    if ref:
+        print(f"\n  「動いた形」は {git('rev-parse','--short',GOOD).stdout.strip()}")
+    return 0
+
+
+if __name__ == "__main__":
+    args = set(sys.argv[1:])
+    if not has_repo():
+        print("  まだ版管理していません。~/.openclaw で git init してください。")
+        sys.exit(1)
+    if "--save" in args:
+        sys.exit(cmd_save(force="--force" in args))
+    if "--rollback" in args:
+        sys.exit(cmd_rollback(quiet="--quiet" in args))
+    if "--diff" in args:
+        sys.exit(cmd_diff())
+    if "--log" in args:
+        sys.exit(cmd_log())
+    sys.exit(cmd_status())

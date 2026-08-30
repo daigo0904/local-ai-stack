@@ -282,6 +282,19 @@ def show_status():
         else:
             say(OK, f"見張り    {label}", f"{int(age)}秒前")
 
+    # 設定が「戻せる状態」にあるか。壊したときに戻せないのが一番困る。
+    cg = os.path.expanduser("~/bin/config-guard")
+    if os.path.exists(cg):
+        r = subprocess.run([cg], capture_output=True, text=True)
+        good = "動いた形" in r.stdout and "まだ無い" not in r.stdout
+        changed = "記録していない変更" in r.stdout
+        if not good:
+            say(NG, "設定      戻せる形がまだ無い", "config-guard --save")
+        elif changed:
+            say(OK, "設定      戻せる（未記録の変更あり）", "config-guard --diff")
+        else:
+            say(OK, "設定      戻せる")
+
     if up:
         print()
         for line in health_lines():

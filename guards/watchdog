@@ -112,6 +112,27 @@ def restart_gateway(wait=30):
     return False
 
 
+def rollback_config():
+    """設定を「動いた形」に戻して、もう一度入れ直す。
+
+    入れ直しても戻らないときの次の手。原因の多くは設定なので、
+    決めてある形に戻すのが、いちばん確実で結果の読める手当てになる。
+    config-guard が戻す前のものも残すので、あとから原因を追える。
+
+    **判断で直そうとしない。**ここは「決めてある形に戻す」だけにする。
+    考えて直すのは、この先の段で人か qwc がやること。"""
+    guard = os.path.expanduser("~/bin/config-guard")
+    if not os.path.exists(guard):
+        return False, "config-guard が無い"
+    r = subprocess.run([guard, "--rollback", "--quiet"],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        return False, "戻せなかった（動いた形がまだ無い可能性）"
+    if not restart_gateway(60):
+        return False, "戻したが、それでも上がらない"
+    return True, "設定を動いた形に戻した"
+
+
 def port_open(port):
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=2):
@@ -239,6 +260,19 @@ def main():
         for k in ("gw_silent", "gw_degraded", "gw_down"):
             state[k] = 0
         state.pop("gw_restarted_at", None)
+        # 元気なうちに「動いた形」を更新しておく。
+        # 動いていることを確かめられるのは今この瞬間だけで、
+        # 壊れてからでは「どの形なら動いたのか」が分からない。
+        # 毎回やると重いので1日1回。
+        today = now.strftime("%Y-%m-%d")
+        # --check や --report は「調べるだけ」。ここで書き込むと、
+        # 呼んだ相手に副作用が返る。
+        if (status == "ok" and state.get("good_saved") != today
+                and not dry and not args & {"--check", "--report"}):
+            cg = os.path.expanduser("~/bin/config-guard")
+            if os.path.exists(cg):
+                subprocess.run([cg, "--save"], capture_output=True, timeout=300)
+                state["good_saved"] = today
     else:
         key = {"silent": "gw_silent", "degraded": "gw_degraded", "down": "gw_down"}[status]
         limit = {"silent": SILENT_BEFORE_RESTART,
@@ -274,10 +308,20 @@ def main():
                        f"\n  {detail}"
                        f"\nこの間の Discord と LINE は届いていないはずです。")
             else:
-                G.log(f"gateway が{status}のまま {count} 回（{detail}） → 入れ直したが戻らなかった")
-                G.notify(f"gateway が {count} 回続けて応答せず、入れ直しても戻りませんでした。"
-                       f"\n  {detail}"
-                       f"\n手で見てください: claw status / launchctl list | grep openclaw")
+                # 入れ直しても戻らない。次の手は「設定を動いた形に戻す」。
+                # 原因の多くは設定で、決めてある形に戻すのが結果の読める手当てになる。
+                G.log(f"gateway が{status}のまま {count} 回（{detail}） → 入れ直しでは戻らなかった")
+                rolled, how = rollback_config()
+                if rolled:
+                    G.log("設定を動いた形に戻して復旧した")
+                    G.notify("gateway が入れ直しても戻らなかったので、設定を動いた形に戻しました。"
+                             f"\n  {detail}"
+                             "\n戻す前の設定は残してあります: config-guard --log")
+                else:
+                    G.log(f"設定を戻しても復旧できなかった（{how}）")
+                    G.notify(f"gateway が入れ直しても設定を戻しても戻りません（{how}）。"
+                             f"\n  {detail}"
+                             "\n手で見てください: claw status / config-guard --log")
 
     G.save_state(state)
     G.beat()

@@ -170,6 +170,27 @@ def poke_until_noticed(guard_name, mark, args, seconds, env=None):
     return log_lines(guard_name) > mark
 
 
+def poke_until_line(guard_name, mark, args, want, seconds):
+    """見張りが、その一行を書くまで呼び続ける。
+
+    「記録が伸びたか」だけで待つと、途中の『連続1回』が出た時点で
+    次へ進んでしまい、手当てまで見届けられない（実際に16秒で落ちた）。
+    見たいのは特定の結末なので、その言葉が出るまで待つ。"""
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            with open(os.path.join(OPENCLAW, "logs", f"{guard_name}.log")) as f:
+                if any(want in l for l in f.readlines()[mark:]):
+                    return True
+        except OSError:
+            pass
+        if lock_free(guard_name):
+            subprocess.run(args, capture_output=True, timeout=300)
+        else:
+            time.sleep(3)
+    return False
+
+
 def log_lines(guard_name):
     """その見張りの記録の行数。訓練の前後で比べて、気づいたかを見る。"""
     try:
@@ -381,6 +402,48 @@ def drill_gateway():
     return True, f"{int(took)}秒で気づいて入れ直した"
 
 
+def drill_config():
+    """設定を壊して、動いた形に戻せるか。**受け口が一時的に止まる。**
+
+    入れ直しても戻らないときの最後の決定論的な手当て。
+    ここが効かないと、設定を触った瞬間に戻れなくなる。"""
+    cg = os.path.join(BIN, "config-guard")
+    conf = os.path.join(OPENCLAW, "openclaw.json")
+    if not os.path.exists(cg):
+        return False, "config-guard が無い"
+    if subprocess.run([cg], capture_output=True, text=True).stdout.count("まだ無い"):
+        return False, "「動いた形」がまだ記録されていない"
+
+    mark = log_lines("watchdog")
+    with open(conf, "a") as f:
+        f.write("\nこれは訓練で壊した行\n")
+    subprocess.run(["launchctl", "kickstart", "-k",
+                    f"gui/{os.getuid()}/ai.openclaw.gateway"], capture_output=True)
+    try:
+        # 壊れた設定で本当に落ちるまで待つ。落ちる前に見張りを呼んでも意味がない。
+        if not wait_until(lambda: not port_open(GATEWAY_PORT), 60, 2):
+            return False, "設定を壊しても受け口が落ちない（訓練にならない）"
+        # 見張りは連続3回で手を出す。その結末が記録に出るまで待つ。
+        poke_until_line("watchdog", mark, [os.path.join(BIN, "watchdog")],
+                        "設定を動いた形に戻して復旧した", 420)
+    finally:
+        # 見張りが戻せなかった場合に備えて、こちらでも必ず戻す
+        subprocess.run([cg, "--rollback", "--quiet"], capture_output=True, timeout=120)
+        subprocess.run(["launchctl", "kickstart", "-k",
+                        f"gui/{os.getuid()}/ai.openclaw.gateway"], capture_output=True)
+
+    if not wait_until(healthy, 180, 5):
+        return False, "訓練のあと受け口が戻らない。手で見ること"
+    # 壊れた設定が捨てられていないか（原因を追えなくなるのが一番困る）
+    log = subprocess.run([cg, "--log"], capture_output=True, text=True).stdout
+    if "戻す前の形" not in log:
+        return False, "戻したが、壊れた設定を残していない"
+    saw, detail = noticed("watchdog", mark, ["設定を動いた形に戻して復旧した"])
+    if not saw:
+        return False, "見張りが設定を戻した形跡がない"
+    return True, "設定を戻して復旧し、壊れた形も残した"
+
+
 DRILLS = [
     ("pulse",    "心拍の相互監視",       drill_pulse,    False),
     ("lock",     "二重に走らない鍵",     drill_lock,     False),
@@ -388,6 +451,7 @@ DRILLS = [
     ("qwc",      "コードを書く側の故障", drill_qwc,      False),
     ("ollama",   "頭脳を止めて復旧",     drill_ollama,   True),
     ("gateway",  "受け口を黙らせて復旧", drill_gateway,  True),
+    ("config",   "設定を壊して巻き戻す", drill_config,   True),
 ]
 
 
