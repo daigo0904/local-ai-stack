@@ -94,6 +94,11 @@ DEGRADED_BEFORE_RESTART = 3
 # 黙っているということなので、そのときだけ肩代わりする。
 # 担当を分けたままにすると「line-guard が死なない前提」の設計になってしまう。
 DOWN_BEFORE_RESTART = 3
+
+# これだけ黙ったら、まだ直している途中でも知らせる。
+# 復旧は3〜5分で終わらせる前提なので、それを超えたら異常事態として扱う。
+# 「30分止まっていました」と後から知るのが一番困る。
+TELL_AFTER = 5 * 60
 # 入れ直したあと、次に入れ直してよくなるまでの間。
 RESTART_COOLDOWN = 900
 
@@ -260,6 +265,8 @@ def main():
         for k in ("gw_silent", "gw_degraded", "gw_down"):
             state[k] = 0
         state.pop("gw_restarted_at", None)
+        state.pop("gw_down_since", None)
+        state.pop("gw_told", None)
         # 元気なうちに「動いた形」を更新しておく。
         # 動いていることを確かめられるのは今この瞬間だけで、
         # 壊れてからでは「どの形なら動いたのか」が分からない。
@@ -285,6 +292,21 @@ def main():
             if k != key:
                 state[k] = 0
         troubles.append(f"gateway が{detail}（連続 {count} 回）")
+
+        # 何回目かではなく、何分黙っているかで知らせる。
+        since = state.get("gw_down_since")
+        if not since:
+            since = now.isoformat(timespec="seconds")
+            state["gw_down_since"] = since
+        try:
+            mins = int((now - datetime.fromisoformat(since)).total_seconds()) // 60
+        except ValueError:
+            mins = 0
+        if mins * 60 >= TELL_AFTER and not state.get("gw_told") and not dry:
+            state["gw_told"] = True
+            G.notify(f"gateway が {mins} 分応答していません（{detail}）。"
+                     f"\nまだ直そうとしていますが、時間がかかっています。")
+            G.log(f"{mins}分 黙っているので途中で知らせた")
 
         last = state.get("gw_restarted_at")
         recent = False

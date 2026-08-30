@@ -41,6 +41,7 @@ model-guard — 頭脳（ollama）が「立っているのに答えない」状�
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -69,9 +70,13 @@ OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_LABEL = "homebrew.mxcl.ollama"
 FALLBACK_MODEL = "gemma4:26b"
 
-# 冷えた状態の読み込みが36秒。その倍以上を待ってから「返らない」と判断する。
+# 冷えた状態の読み込みが36秒。その倍近くを待ってから「返らない」と判断する。
+#
+# 90秒にしていたが、1回の点検に1分49秒かかっていた。2分おきに走らせている
+# のに1回が2分近いので、実質「1回試すのに2巡ぶん」使っていたことになる。
+# 復旧までの時間は、判断の回数ではなくここで決まっていた。
 # 環境変数で短くできるのは、復旧の段取りを試すため（本番では触らない）。
-PROBE_TIMEOUT = int(os.environ.get("MODEL_GUARD_TIMEOUT", "90"))
+PROBE_TIMEOUT = int(os.environ.get("MODEL_GUARD_TIMEOUT", "60"))
 # 生成中かどうかの境目。実測では待機がちょうど 0.0%、生成の終わりぎわで 6.8% だった。
 BUSY_CPU = 3.0
 
@@ -80,6 +85,9 @@ BUSY_CPU = 3.0
 KILL_RUNNER_AFTER = 2
 RESTART_OLLAMA_AFTER = 3
 GIVE_UP_AFTER = 5
+# これだけ黙ったら、まだ直している途中でも知らせる。
+# 復旧は3〜5分で終わらせる前提なので、それを超えたら異常事態として扱う。
+TELL_AFTER = 5 * 60
 
 
 
@@ -146,6 +154,30 @@ def probe(model):
         return time.time() - t0
     except Exception:
         return None
+
+
+def resume_stopped():
+    """止められたまま残っているプロセスを動かし直す。
+
+    落ちてはいないが、止められていて応答しない状態がある。
+    このとき厄介なのは、**止まったプロセスもポートを握り続ける**こと。
+    launchctl で入れ直しても、新しい方が
+    `bind: address already in use` で上がれず、孤児が残ったままになる。
+
+    入れ直すより先に、まずこれを試す。いちばん軽くて、いちばん結果が読める。"""
+    woke = 0
+    for pat in ("ollama serve", "llama-server"):
+        out = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
+        for pid in out.stdout.split():
+            st = subprocess.run(["ps", "-p", pid, "-o", "state="],
+                                capture_output=True, text=True).stdout.strip()
+            if "T" in st:
+                try:
+                    os.kill(int(pid), signal.SIGCONT)
+                    woke += 1
+                except (OSError, ProcessLookupError):
+                    pass
+    return woke
 
 
 def kill_runner():
@@ -216,7 +248,10 @@ def main():
     # 後ろに置くと ollama が重い日に相手の死を見つけるのが遅れる。
     watchdog_note = check_watchdog(state, dry)
 
-    took = probe(model)
+    # **先に入り口を見る。**閉じているなら5秒で分かることを、
+    # 1トークン生成の時間切れ（最大60秒）まで待つ必要はない。
+    # ここを後ろに置いていたせいで、落ちているときの1回が1分49秒かかっていた。
+    took = probe(model) if alive() else None
 
     if took is not None:
         # 直った、あるいはずっと元気だった。
@@ -227,6 +262,7 @@ def main():
                 G.notify(f"ローカルのモデルが {t0.strftime('%H:%M')} から {span} 応答しませんでした。"
                        f"いま復旧しています（{model}・{took:.1f}秒で応答）。"
                        f"\nこの間に投げた依頼は返っていないはずです。")
+        state.pop("told", None)
         state.update({"last_ok": datetime.now().isoformat(timespec="seconds"),
                       "last_ok_seconds": round(took, 1), "model": model, "fails": 0})
         state.pop("down_since", None)
@@ -267,6 +303,24 @@ def main():
         return 1
     if dry:
         print(f"[dry-run] {fails} 回目・{cause} → ここで手を出すところ")
+        return 1
+
+    # 何回目かではなく、**何分黙っているか**で知らせる。
+    # 「30分止まっていました」と後から知るのが一番困るので、
+    # 段取りの途中でも、決めた時間を超えたらその場で伝える。
+    t0, span = describe_span(state.get("down_since"))
+    if t0 and (datetime.now() - t0).total_seconds() >= TELL_AFTER and not state.get("told"):
+        state["told"] = True
+        save_state(state)
+        G.notify(f"ローカルのモデルが {span} 応答していません（{cause}）。"
+                 f"\nまだ直そうとしていますが、時間がかかっています。")
+        G.log(f"{span} 黙っているので途中で知らせた")
+
+    # 段取りの一番手前。止められているだけなら、これで戻る。
+    # 入れ直しより先に試すのは、孤児がポートを握って新しい方が上がれなくなるため。
+    woke = resume_stopped()
+    if woke:
+        G.log(f"止められていたプロセスを動かし直した ({woke} 件)")
         return 1
 
     if fails == GIVE_UP_AFTER:

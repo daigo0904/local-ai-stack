@@ -11,7 +11,7 @@
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
-  <integer>120</integer>
+  <integer>60</integer>
   <key>StandardOutPath</key>
   <string>__HOME__/.openclaw/logs/model-guard.out</string>
   <key>StandardErrorPath</key>

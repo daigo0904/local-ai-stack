@@ -11,7 +11,7 @@
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
-  <integer>180</integer>
+  <integer>60</integer>
   <key>StandardOutPath</key>
   <string>__HOME__/.openclaw/logs/watchdog.out</string>
   <key>StandardErrorPath</key>
