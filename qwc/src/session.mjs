@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SESSION_DIR } from './config.mjs';
+import { withoutHint } from './smalltalk.mjs';
 
 export function newSessionId() {
   const now = new Date();
@@ -59,7 +60,7 @@ export function listSessions(limit = 20) {
             root: parsed.root,
             model: parsed.model,
             turns: (parsed.messages || []).filter((m) => m.role === 'user').length,
-            firstUser: (parsed.messages || []).find((m) => m.role === 'user')?.content?.slice(0, 60) || ''
+            firstUser: withoutHint((parsed.messages || []).find((m) => m.role === 'user')?.content || '').slice(0, 60)
           };
         } catch {
           /* 壊れたファイルは飛ばす */

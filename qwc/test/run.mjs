@@ -35,7 +35,7 @@ import {
 import { parseEdits } from '../src/agent.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
-import { classifyInput, SMALL_TALK_HINT } from '../src/smalltalk.mjs';
+import { classifyInput, SMALL_TALK_HINT, withoutHint } from '../src/smalltalk.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
 import { startMcp, stopMcp } from '../src/mcp.mjs';
 import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits } from '../src/edits.mjs';
@@ -1305,6 +1305,13 @@ console.log('\n雑談か作業かの自動判定');
   check('長い貼り付けは作業', classifyInput('a\nb\nc\nd\ne\nf\ng').smallTalk === false);
   check('空の入力は作業側（判定しない）', classifyInput('').smallTalk === false);
   check('添える一言はファイルを変えるなと言う', /ファイルは変更しないこと/.test(SMALL_TALK_HINT));
+
+  // 添える先が利用者の発言そのものなので、人に見せる文からは外す。
+  // 外し忘れて、会話の一覧に判定の説明文が並んでいた（実機で発覚）。
+  check('人に見せるときは添えた一言を外す',
+    withoutHint('税率が古いなあ' + SMALL_TALK_HINT) === '税率が古いなあ');
+  check('添えていない発言はそのまま', withoutHint('テストを直して') === 'テストを直して');
+  check('空でも落ちない', withoutHint(undefined) === '');
   check('読む道具は使ってよいと言う', /read_file/.test(SMALL_TALK_HINT));
 
   // 判定を外したときの受け皿。書き換える道具に手が伸びたら聞く
