@@ -27,7 +27,7 @@ BIN = os.path.join(HOME, "bin")
 AGENTS = os.path.join(HOME, "Library", "LaunchAgents")
 ENV_FILE = os.path.join(HOME, ".openclaw", ".env")
 
-GUARDS = ["model-guard", "watchdog", "line-guard", "qwc-guard", "claw"]
+GUARDS = ["guardlib.py", "model-guard", "watchdog", "line-guard", "qwc-guard", "claw"]
 LABELS = ["ai.openclaw.model-guard", "ai.openclaw.watchdog", "ai.openclaw.line-guard",
           "ai.openclaw.qwc-guard"]
 
@@ -70,6 +70,18 @@ def do_install():
         r = launchctl("bootstrap", f"gui/{os.getuid()}", dst)
         ok = r.returncode == 0
         print(f"  登録{'した' if ok else 'できなかった'}  {label}")
+
+    # 共有部品が壊れていないかを、ここで必ず確かめる。
+    # 4つの見張りが全部これを読み込むので、壊れていれば全部起動しない。
+    # 重複で守るのをやめた代わりに置いた検査なので、飛ばさない。
+    print()
+    r = subprocess.run([sys.executable, os.path.join(BIN, "guardlib.py"), "--selftest"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        print("  共有部品の検査: 通った")
+    else:
+        print("  ! 共有部品の検査が通りません。見張りは動きません。")
+        print("    " + r.stdout.strip().replace("\n", "\n    "))
 
     print()
     missing = [k for k in NEEDED_KEYS if not env_has(k)]

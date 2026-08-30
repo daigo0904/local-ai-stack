@@ -49,13 +49,20 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
+# 見張りが共有する部品。同じものを4つに書き写していたが、
+# 書き写した当日に編集で1つ壊し、説明文もずれていた。
+# 独立を支えているのは別プロセス・別の時計・別の判断であって、
+# 同じ文字列を別々に持つことではない。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, env_value, pulse_age, kickstart  # noqa: E402
+
+G = Guard("line-guard")
+
+
 ENV_FILE = os.path.expanduser("~/.openclaw/.env")
 TUNNEL_LOG = "/tmp/cloudflared-line.log"
 SYNC_LOG = "/tmp/line-webhook-sync.log"
 LINE_API = "https://api.line.me/v2/bot/channel/webhook"
-GUARD_LOG = os.path.expanduser("~/.openclaw/logs/line-guard.log")
-STATE_FILE = os.path.expanduser("~/.openclaw/line-guard-state.json")
-PULSE_DIR = os.path.expanduser("~/.openclaw/pulse")
 
 # 外に出られるかを確かめる相手。名前ではなく数字で書く（DNSが死んでいても試せる）。
 PROBE_HOSTS = [("1.1.1.1", 443), ("8.8.8.8", 443), ("9.9.9.9", 443)]
@@ -73,76 +80,7 @@ GATEWAY_PORT = 18789
 URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
 
-def beat(name):
-    """「今回ちゃんと走り切った」という跡を残す。watchdog がこれを見る。
 
-    ここが無いあいだ、line-guard を見張る者は誰もいなかった。
-    LINE の入り口を守っているのはこれ1つなので、これが黙ると
-    「入り口が切れているのに、切れたことに誰も気づかない」状態になる。
-
-    心拍のコードは model-guard / watchdog にも同じものがある。
-    **わざと共有していない。**共通の部品にすると、そこが壊れたとき
-    見張りが揃って黙る。互いを見張る意味が消えるので、10行のために独立を捨てない。"""
-    try:
-        os.makedirs(PULSE_DIR, exist_ok=True)
-        with open(os.path.join(PULSE_DIR, f"{name}.json"), "w") as f:
-            json.dump({"at": datetime.now().isoformat(timespec="seconds")}, f)
-    except OSError:
-        pass
-
-
-def log(msg):
-    os.makedirs(os.path.dirname(GUARD_LOG), exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(GUARD_LOG, "a") as f:
-        f.write(f"[{stamp}] {msg}\n")
-
-
-def env_value(key):
-    """環境変数、無ければ ~/.openclaw/.env から拾う。"""
-    v = os.environ.get(key)
-    if v:
-        return v.strip()
-    try:
-        for row in open(ENV_FILE):
-            row = row.strip()
-            if row.startswith(f"{key}="):
-                return row.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return None
-
-
-def notify(text):
-    """Discord に一言送る。
-
-    宛先が分からないときは**黙って捨てず**ログに残す。
-    見張りの知らせが届かないうえ、届いていないことすら分からないのが一番困る。
-    宛先（DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID）は ~/.openclaw/.env に置く。
-    ここに直書きしないのは、この一式を公開したときに個人の部屋の番号が出るため。"""
-    tok = env_value("DISCORD_BOT_TOKEN")
-    channel = env_value("DISCORD_CHANNEL_ID")
-    if not tok or not channel:
-        log("通知先が設定されていない（DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID）: " + text)
-        print(text)
-        return
-    body = json.dumps({"content": text[:1950]}).encode()
-    req = urllib.request.Request(
-        f"https://discord.com/api/v10/channels/{channel}/messages",
-        data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bot {tok}",
-                 "User-Agent": "openclaw-guards (local, 1.0)"},
-    )
-    try:
-        urllib.request.urlopen(req, timeout=30).read()
-    except Exception:
-        log("Discord に送れなかった: " + text.splitlines()[0])
-
-
-def kickstart(label):
-    subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
-                   capture_output=True)
 
 
 def port_open(port):
@@ -214,33 +152,18 @@ def dns_ok():
         return False
 
 
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def save_state(state):
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, ensure_ascii=False)
-    except OSError:
-        pass
 
 
 def mark_down(cause):
     """落ちはじめた時刻と理由を覚えておく。すでに覚えていれば触らない。"""
-    state = load_state()
+    state = G.load_state()
     if not state.get("down_since"):
         state["down_since"] = datetime.now().isoformat(timespec="seconds")
         state["cause"] = cause
-        save_state(state)
+        G.save_state(state)
     elif state.get("cause") != cause:
         state["cause"] = cause
-        save_state(state)
+        G.save_state(state)
 
 
 def mark_up():
@@ -249,9 +172,9 @@ def mark_up():
     ネットが切れている間は Discord にも LINE にも何も送れない。
     だから「切れた瞬間に知らせる」は原理的に無理で、
     代わりに「戻った瞬間に、どれだけ落ちていたかをまとめて出す」。"""
-    state = load_state()
+    state = G.load_state()
     since = state.get("down_since")
-    save_state({})
+    G.save_state({})
     if not since:
         return None
     try:
@@ -348,7 +271,7 @@ def main():
         if dry:
             failed.append("gateway が止まっている")
         else:
-            log("gateway が止まっていたので起こす")
+            G.log("gateway が止まっていたので起こす")
             subprocess.run(["openclaw", "daemon", "start"], capture_output=True)
             time.sleep(10)
             if port_open(GATEWAY_PORT):
@@ -361,7 +284,7 @@ def main():
         if dry:
             failed.append("中継が待ち受けていない")
         else:
-            log("中継が落ちていたので入れ直す")
+            G.log("中継が落ちていたので入れ直す")
             kickstart(PROXY_LABEL)
             time.sleep(5)
             if port_open(PROXY_PORT):
@@ -380,7 +303,7 @@ def main():
 
     if net_down:
         mark_down(net_down)
-        log(f"{net_down}。戻るまでトンネルは触らない")
+        G.log(f"{net_down}。戻るまでトンネルは触らない")
         if report:
             print("LINE の入り口の状態")
             print(f"  gateway : {'OK' if port_open(GATEWAY_PORT) else '止まっている'}")
@@ -398,32 +321,32 @@ def main():
     if not ok and not dry and funnel_mode():
         # Funnel は URL が変わらない。やることは「出し直す」だけで、
         # 登録の書き換えも新URLの待ち受けも要らない。
-        log(f"LINEから届かない（登録: {registered_url()}）。Funnel を出し直す")
+        G.log(f"LINEから届かない（登録: {registered_url()}）。Funnel を出し直す")
         if not funnel_up():
             failed.append("Funnel を出し直せなかった")
-            log("復旧できず: Funnel が上がらない")
+            G.log("復旧できず: Funnel が上がらない")
         elif tunnel_reachable():
             fixed.append("LINEの入り口(Funnel)を出し直した")
-            log("復旧: Funnel を出し直した")
+            G.log("復旧: Funnel を出し直した")
         else:
             failed.append("Funnel は上がったがLINEからまだ届かない")
-            log("復旧できず: 出し直してもLINEから届かない")
+            G.log("復旧できず: 出し直してもLINEから届かない")
     elif not ok and not dry:
-        log(f"LINEから届かない（登録: {registered_url()}）。トンネルを入れ直す")
+        G.log(f"LINEから届かない（登録: {registered_url()}）。トンネルを入れ直す")
         kickstart(TUNNEL_LABEL)
         new = wait_new_url(url)
         if not new:
             failed.append("トンネルを張り直せなかった")
-            log("復旧できず: 新しいURLが出ない")
+            G.log("復旧できず: 新しいURLが出ない")
         elif not sync_caught_up(new):
             failed.append(f"新URL({new})がLINE側に反映されない")
-            log("復旧できず: LINEへの登録が進まない")
+            G.log("復旧できず: LINEへの登録が進まない")
         elif tunnel_reachable():
             fixed.append(f"LINEの入り口を張り直した → {new}")
-            log(f"復旧: {new}")
+            G.log(f"復旧: {new}")
         else:
             failed.append("張り直したがLINEからまだ届かない")
-            log("復旧できず: 張り直し後もLINEから届かない")
+            G.log("復旧できず: 張り直し後もLINEから届かない")
     elif not ok and dry:
         failed.append(f"LINEから届かない（登録: {registered_url()}）")
 
@@ -451,11 +374,11 @@ def main():
     # 普段は黙る。動いたときだけ知らせる。
     if back:
         tail = ("\n" + "\n".join(f"・{f}" for f in fixed)) if fixed else ""
-        notify("🔧 " + back + tail)
+        G.notify("🔧 " + back + tail)
     elif fixed and not failed:
-        notify("🔧 LINEの入り口が切れていたので直しました。\n" + "\n".join(f"・{f}" for f in fixed))
+        G.notify("🔧 LINEの入り口が切れていたので直しました。\n" + "\n".join(f"・{f}" for f in fixed))
     elif failed:
-        notify("⚠️ LINEの入り口が切れています。自動では直せませんでした。\n"
+        G.notify("⚠️ LINEの入り口が切れています。自動では直せませんでした。\n"
                + "\n".join(f"・{f}" for f in failed)
                + "\n`claw status` と /tmp/cloudflared-line.log を確認してください。")
     return 0 if not failed else 1
@@ -465,5 +388,5 @@ if __name__ == "__main__":
     code = main()
     # 走り切ったときだけ残す。途中で落ちたら心拍は古いままになり、
     # watchdog がそれを見て蹴り直す。
-    beat("line-guard")
+    G.beat()
     sys.exit(code)

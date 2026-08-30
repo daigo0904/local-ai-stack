@@ -50,11 +50,17 @@ import time
 import urllib.request
 from datetime import datetime
 
+# 見張りが共有する部品。同じものを4つに書き写していたが、
+# 書き写した当日に編集で1つ壊し、説明文もずれていた。
+# 独立を支えているのは別プロセス・別の時計・別の判断であって、
+# 同じ文字列を別々に持つことではない。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, env_value, pulse_age, kickstart  # noqa: E402
+
+G = Guard("watchdog")
+
+
 ENV_FILE = os.path.expanduser("~/.openclaw/.env")
-GUARD_LOG = os.path.expanduser("~/.openclaw/logs/watchdog.log")
-STATE_FILE = os.path.expanduser("~/.openclaw/watchdog-state.json")
-PULSE_DIR = os.path.expanduser("~/.openclaw/pulse")
-LOCK_FILE = os.path.expanduser("~/.openclaw/watchdog.lock")
 PLIST_DIR = os.path.expanduser("~/Library/LaunchAgents")
 
 OPENCLAW = "/opt/homebrew/bin/openclaw"
@@ -92,97 +98,7 @@ DOWN_BEFORE_RESTART = 3
 RESTART_COOLDOWN = 900
 
 
-def log(msg):
-    os.makedirs(os.path.dirname(GUARD_LOG), exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(GUARD_LOG, "a") as f:
-        f.write(f"[{stamp}] {msg}\n")
 
-
-def env_value(key):
-    """環境変数、無ければ ~/.openclaw/.env から拾う。"""
-    v = os.environ.get(key)
-    if v:
-        return v.strip()
-    try:
-        for row in open(ENV_FILE):
-            row = row.strip()
-            if row.startswith(f"{key}="):
-                return row.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return None
-
-
-def notify(text):
-    """Discord に一言送る。
-
-    宛先が分からないときは**黙って捨てず**ログに残す。
-    見張りの知らせが届かないうえ、届いていないことすら分からないのが一番困る。
-    宛先（DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID）は ~/.openclaw/.env に置く。
-    ここに直書きしないのは、この一式を公開したときに個人の部屋の番号が出るため。"""
-    tok = env_value("DISCORD_BOT_TOKEN")
-    channel = env_value("DISCORD_CHANNEL_ID")
-    if not tok or not channel:
-        log("通知先が設定されていない（DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID）: " + text)
-        print(text)
-        return
-    body = json.dumps({"content": text[:1950]}).encode()
-    req = urllib.request.Request(
-        f"https://discord.com/api/v10/channels/{channel}/messages",
-        data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bot {tok}",
-                 "User-Agent": "openclaw-guards (local, 1.0)"},
-    )
-    try:
-        urllib.request.urlopen(req, timeout=30).read()
-    except Exception:
-        log("Discord に送れなかった: " + text.splitlines()[0])
-
-
-# 心拍のやりとり。model-guard / line-guard 側にも同じものを置いてある。
-#
-# **わざと共有していない。**共通の部品にすると、そこが壊れたとき
-# 見張りが揃って黙る。互いを見張る意味が消えるので、
-# 10行のために独立を捨てない。
-def beat(name):
-    try:
-        os.makedirs(PULSE_DIR, exist_ok=True)
-        with open(os.path.join(PULSE_DIR, f"{name}.json"), "w") as f:
-            json.dump({"at": datetime.now().isoformat(timespec="seconds")}, f)
-    except OSError:
-        pass
-
-
-def pulse_age(name):
-    """相手が最後に走り切ってから何秒たったか。一度も走っていなければ None。"""
-    try:
-        with open(os.path.join(PULSE_DIR, f"{name}.json")) as f:
-            at = datetime.fromisoformat(json.load(f)["at"])
-        return (datetime.now() - at).total_seconds()
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def kickstart(label):
-    """蹴り直す。**読み込まれていない plist は蹴れない**ので、そのときは読み込む。
-
-    ここは一度、直っていないのに「入れ直した」と記録していた。
-    launchctl kickstart は plist が外れていると
-    `Could not find service ... in domain for user gui` で失敗するだけで、
-    戻り値を捨てていたため、ログにだけ復旧したと書き残っていた。
-    **嘘をつく見張りは、居ないより悪い。**"""
-    r = subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
-                       capture_output=True, text=True)
-    if r.returncode == 0:
-        return True
-    plist = os.path.join(PLIST_DIR, f"{label}.plist")
-    if not os.path.exists(plist):
-        return False
-    b = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist],
-                       capture_output=True, text=True)
-    return b.returncode == 0
 
 
 def restart_gateway(wait=30):
@@ -238,35 +154,7 @@ def gateway_health():
     return "silent", "health に gateway の行が出ない"
 
 
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
 
-
-def save_state(state):
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, ensure_ascii=False)
-    except OSError:
-        pass
-
-
-def hold_lock():
-    """同時に2つ走らないようにする。取れなければ None。
-
-    ここも一度やらかしている。手で走らせたぶんと launchd の定期実行が
-    重なり、両方が「連続3回」と数えて gateway を2回入れ直した。
-    見張りが2つ同時に手を出すと、直すつもりで壊すことになる。"""
-    try:
-        f = open(LOCK_FILE, "w")
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return f
-    except (OSError, BlockingIOError):
-        return None
 
 
 def main():
@@ -275,9 +163,9 @@ def main():
 
     # 調べるだけのときは、走っている相手の邪魔をしないので鍵は要らない。
     if not dry and "--report" not in args and "--check" not in args:
-        if hold_lock() is None:
+        if not G.hold_lock():
             return 0
-    state = load_state()
+    state = G.load_state()
     now = datetime.now()
     troubles = []
 
@@ -294,9 +182,9 @@ def main():
         troubles.append(f"model-guard が{mg}")
         if not dry:
             ok = kickstart(MODEL_GUARD_LABEL)
-            log(f"model-guard が{mg} → 蹴った（{'成功' if ok else '失敗'}）")
+            G.log(f"model-guard が{mg} → 蹴った（{'成功' if ok else '失敗'}）")
             if not state.get("mg_told"):
-                notify(f"見張り（model-guard）が{mg}ので蹴り直しました。"
+                G.notify(f"見張り（model-guard）が{mg}ので蹴り直しました。"
                        f"\nこれが黙っているあいだ、ローカルのモデルは誰も見ていません。")
                 state["mg_told"] = True
     else:
@@ -318,9 +206,9 @@ def main():
         troubles.append(f"line-guard が{lg}")
         if not dry:
             ok = kickstart(LINE_GUARD_LABEL)
-            log(f"line-guard が{lg} → 蹴った（{'成功' if ok else '失敗'}）")
+            G.log(f"line-guard が{lg} → 蹴った（{'成功' if ok else '失敗'}）")
             if not state.get("lg_told"):
-                notify(f"見張り（line-guard）が{lg}ので蹴り直しました。"
+                G.notify(f"見張り（line-guard）が{lg}ので蹴り直しました。"
                        f"\nこれが黙っているあいだ、LINEの入り口は誰も見ていません。")
                 state["lg_told"] = True
     else:
@@ -343,7 +231,7 @@ def main():
         troubles.append(f"qwc-guard が{qg}")
         if not dry:
             kickstart(QWC_GUARD_LABEL)
-            log(f"qwc-guard が{qg} → 蹴った")
+            G.log(f"qwc-guard が{qg} → 蹴った")
 
     # 4. gateway は立っているのに黙っていないか
     status, detail = gateway_health()
@@ -373,26 +261,26 @@ def main():
                 recent = False
 
         if dry or count < limit:
-            log(f"gateway が{status}（{detail}・連続 {count} 回）")
+            G.log(f"gateway が{status}（{detail}・連続 {count} 回）")
         elif recent:
-            log(f"gateway が{status}（{detail}）だが、入れ直した直後なので待つ")
+            G.log(f"gateway が{status}（{detail}）だが、入れ直した直後なので待つ")
         else:
             state["gw_restarted_at"] = now.isoformat(timespec="seconds")
             state[key] = 0
             came_back = restart_gateway()
             if came_back:
-                log(f"gateway が{status}のまま {count} 回（{detail}） → 入れ直して戻った")
-                notify(f"gateway が {count} 回続けて応答しなかったので入れ直しました。"
+                G.log(f"gateway が{status}のまま {count} 回（{detail}） → 入れ直して戻った")
+                G.notify(f"gateway が {count} 回続けて応答しなかったので入れ直しました。"
                        f"\n  {detail}"
                        f"\nこの間の Discord と LINE は届いていないはずです。")
             else:
-                log(f"gateway が{status}のまま {count} 回（{detail}） → 入れ直したが戻らなかった")
-                notify(f"gateway が {count} 回続けて応答せず、入れ直しても戻りませんでした。"
+                G.log(f"gateway が{status}のまま {count} 回（{detail}） → 入れ直したが戻らなかった")
+                G.notify(f"gateway が {count} 回続けて応答せず、入れ直しても戻りませんでした。"
                        f"\n  {detail}"
                        f"\n手で見てください: claw status / launchctl list | grep openclaw")
 
-    save_state(state)
-    beat("watchdog")
+    G.save_state(state)
+    G.beat()
 
     if "--check" in args:
         print("NG " + " / ".join(troubles) if troubles else "OK")
