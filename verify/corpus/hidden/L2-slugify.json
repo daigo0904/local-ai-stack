@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport re\nfrom text import slugify\ncases = {\"Hello, World!\": \"hello-world\", \"Hello World\": \"hello-world\", \"What?! Really...\": \"what-really\",\n         \"C++ is great!\": \"c-is-great\", \"Top 10 Tips!\": \"top-10-tips\", \"  Foo   Bar  \": \"foo-bar\",\n         \"(Hello) [World]\": \"hello-world\", \"simple\": \"simple\", \"Price: $100\": \"price-100\"}\nfor s, exp in cases.items():\n    r = slugify(s)\n    assert r == exp, (s, r, exp)\nfor s in [\"a@b#c d\", \"x & y\", \"Hi!!! there???\", \"#tag 'quoted' \\\"dq\\\"\"]:\n    r = slugify(s)\n    assert re.fullmatch(r\"[a-z0-9]+(-[a-z0-9]+)*\", r), (s, r)\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "slugify strips punctuation/symbols on several new inputs, output is clean a-z0-9-hyphen slug"
+}

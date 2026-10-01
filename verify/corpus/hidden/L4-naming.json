@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport ast\nsrc = open(\"calc.py\").read()\nfor n in ast.walk(ast.parse(src)):\n    if isinstance(n, ast.FunctionDef):\n        args = [a.arg for a in n.args.args]\n        assigned = {t.id for s in ast.walk(n) if isinstance(s, ast.Assign) for t in s.targets if isinstance(t, ast.Name)}\n        assert not (args == [\"a\", \"b\"] and \"c\" in assigned), \"names unchanged\"\nfrom calc import f\nfor a, b in [(3,4),(0,5),(-2,7),(1.5,2),(10**12,3),(\"ab\",3),([1],2)]:\n    assert f(a, b) == a * b, (a, b)\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "variables a/b/c renamed (not all left) and f(a,b) still equals a*b on varied inputs"
+}

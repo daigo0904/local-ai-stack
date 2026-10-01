@@ -1,0 +1,5 @@
+{
+ "files": {},
+ "run": [],
+ "note": "Posting to real Slack is an external action; not checkable offline"
+}

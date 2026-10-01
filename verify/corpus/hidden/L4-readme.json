@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nsrc = open(\"README.md\", encoding=\"utf-8\").read()\nassert len(src.strip()) > 40 and src.strip() != \"# tool\\nrun it.\", \"README not rewritten\"\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "README.md exists and was substantively rewritten (quality itself is human judgement)"
+}

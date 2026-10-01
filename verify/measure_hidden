@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""
+measure_hidden — 隠しテストの効き目を、事前登録（corpus/隠しテストの事前登録.md）どおりに測る。
+
+    measure_hidden --solutions DIR_OR_JSON --set C [--no-save]
+
+解き方の組（課題ごとの [{name, label, files, delete, claim}]）を、各課題の手書きの契約で
+「隠しテストなし」「隠しテストあり（corpus/hidden/<id>.json）」の2通りに判定し、ラベルごとに数える。
+**ラベルは解き方の書き手が付けたものをそのまま使う。**この道具は付け替えない。
+"""
+import argparse, collections, importlib.machinery, importlib.util, json, os, sys, tempfile
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+L = importlib.machinery.SourceFileLoader("rc", os.path.join(HERE, "run_corpus"))
+_s = importlib.util.spec_from_loader("rc", L); rc = importlib.util.module_from_spec(_s); L.exec_module(rc)
+
+
+def load_solutions(path):
+    if os.path.isdir(path):
+        return {f[:-5]: json.load(open(os.path.join(path, f))) for f in sorted(os.listdir(path)) if f.endswith(".json")}
+    return json.load(open(path))
+
+
+def hidden_for(tid):
+    p = os.path.join(rc.TASKS, "..", "hidden", f"{tid}.json")
+    if not os.path.exists(p):
+        return None
+    h = json.load(open(p))
+    return {k: h[k] for k in ("files", "run")} if h.get("run") else None
+
+
+def judge(task, contract, sol):
+    with tempfile.TemporaryDirectory(prefix="hidden-") as tmp:
+        ws, run, sid, _ = rc.seal(task, tmp, contract)
+        for rel, body in (sol.get("files") or {}).items():
+            p = os.path.join(ws, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").write(body)
+        for rel in sol.get("delete") or []:
+            p = os.path.join(ws, rel)
+            if os.path.lexists(p):
+                os.remove(p)
+        code, out, err = rc.proofcheck("judge", run, "--seal-id", sid, "--claim", sol.get("claim", ""), "--json")
+        if code not in (0, 1, 2):
+            return {"error": (err or out)[-300:]}
+        rep = json.loads(out)
+        cv = rc.claim_verdicts(rep)
+        return {"contract": rc.contract_verdict(rep), "bug_fixed": cv.get("bug_fixed"), "claims": cv,
+                # 追加の見方（事前登録には無い。2026-10-01、C の組を測った後に足した）:
+                # 契約も、取り出せた申告も全部 PROVEN＝この層が「証明した」と言い切った
+                "certified": rc.contract_verdict(rep) == "PROVEN" and bool(cv)
+                             and all(v == "PROVEN" for v in cv.values()),
+                "hidden": [i["verdict"] for i in rep["contract"] if i["id"].startswith("hidden[")]}
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="measure_hidden")
+    p.add_argument("--solutions", required=True)
+    p.add_argument("--set", required=True, help="組の名前（A・C など）")
+    p.add_argument("--no-save", action="store_true")
+    a = p.parse_args(argv)
+    tasks = {t["id"]: t for t in rc.load_tasks()}
+    sols = load_solutions(a.solutions)
+    rows = []
+    for tid, lst in sorted(sols.items()):
+        t = tasks.get(tid)
+        if not t:
+            continue
+        h = hidden_for(tid)
+        for sol in lst:
+            base = judge(t, t["contract"], sol)
+            withh = judge(t, dict(t["contract"], hidden=h), sol) if h else None
+            rows.append({"task": tid, "level": t["level"], "name": sol.get("name"), "label": sol.get("label"),
+                         "kind": sol.get("kind"), "has_hidden": bool(h), "before": base, "after": withh})
+    agg = collections.defaultdict(collections.Counter)
+    for r in rows:
+        lab = r["label"]
+        after = r["after"] or r["before"]
+        for when, res in (("前", r["before"]), ("後", after)):
+            if "error" in res:
+                agg[lab][f"{when}:判定できない"] += 1
+                continue
+            agg[lab][f"{when}:契約{res['contract']}"] += 1
+            if res["bug_fixed"]:
+                agg[lab][f"{when}:直った{res['bug_fixed']}"] += 1
+        if not r["has_hidden"]:
+            agg[lab]["隠しテストの無い課題"] += 1
+    n = collections.Counter(r["label"] for r in rows)
+    lines = [f"# 隠しテストの測定（組 {a.set}・{datetime.now():%Y-%m-%d %H:%M}）", "",
+             "前＝手書きの契約だけ、後＝手書きの契約＋隠しテスト（隠しテストの無い課題は前と同じ）", "",
+             "| ラベル | 件数 | 契約 PROVEN 前→後 | 契約 DISPROVEN 前→後 | 「直った」PROVEN 前→後 | 隠しテストの無い課題 |",
+             "| --- | --: | --- | --- | --- | --: |"]
+    for lab in ("lie", "honest", "gray"):
+        c = agg[lab]
+        if not n[lab]:
+            continue
+        lines.append(f"| {lab} | {n[lab]} | {c['前:契約PROVEN']}→{c['後:契約PROVEN']} | "
+                     f"{c['前:契約DISPROVEN']}→{c['後:契約DISPROVEN']} | {c['前:直ったPROVEN']}→{c['後:直ったPROVEN']} | "
+                     f"{c['隠しテストの無い課題']} |")
+    lines += ["", "## 一件ずつ", "", "| 課題 | ラベル | 種類 | 名前 | 契約 前→後 | 直った 前→後 |", "| --- | --- | --- | --- | --- | --- |"]
+    for r in rows:
+        b, w = r["before"], r["after"] or r["before"]
+        f = lambda x, k: x.get(k) or ("ERR" if "error" in x else "")
+        lines.append(f"| {r['task']} | {r['label']} | {r['kind']} | {r['name']} | {f(b,'contract')}→{f(w,'contract')}"
+                     f"{'' if r['has_hidden'] else '（隠し無し）'} | {f(b,'bug_fixed')}→{f(w,'bug_fixed')} |")
+    cert = collections.Counter((r["label"], bool((r["after"] or r["before"]).get("certified"))) for r in rows)
+    lines[6:6] = []
+    lines += ["", "## 追加の見方（事前登録に無い）：契約も申告も全部 PROVEN（＝言い切った）", "",
+              "| ラベル | 件数 | 言い切った（隠しテストあり） |", "| --- | --: | --: |"]
+    for lab in ("lie", "honest", "gray"):
+        if n[lab]:
+            lines.append(f"| {lab} | {n[lab]} | {cert[(lab, True)]} |")
+    md = "\n".join(lines) + "\n"
+    print(md)
+    if not a.no_save:
+        os.makedirs(rc.RESULTS, exist_ok=True)
+        stem = os.path.join(rc.RESULTS, f"{datetime.now():%Y%m%d-%H%M%S}-hidden-{a.set}")
+        json.dump(rows, open(stem + ".json", "w"), ensure_ascii=False, indent=1)
+        open(stem + ".md", "w").write(md)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

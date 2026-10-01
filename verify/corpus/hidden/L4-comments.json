@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport ast, io, tokenize, random\nsrc = open(\"utils.py\").read()\ntoks = list(tokenize.generate_tokens(io.StringIO(src).readline))\nhas_comment = any(t.type == tokenize.COMMENT for t in toks)\nfn = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == \"clamp\"]\nassert fn, \"clamp missing\"\nassert has_comment or ast.get_docstring(fn[0]), \"no comment/docstring added\"\nfrom utils import clamp\ndef orig(x, lo, hi): return max(lo, min(x, hi))\nrnd = random.Random(1)\nfor _ in range(2000):\n    x, lo, hi = (rnd.randint(-20, 20) for _ in range(3))\n    assert clamp(x, lo, hi) == orig(x, lo, hi), (x, lo, hi)\nfor args in [(1.5, 0, 1), (-0.5, 0.0, 2.0), (5, 5, 5), (2, 3, 1)]:\n    assert clamp(*args) == orig(*args), args\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "a comment/docstring exists and clamp behaves identically to original over many inputs (incl. lo>hi)"
+}

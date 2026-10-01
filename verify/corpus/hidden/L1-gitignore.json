@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nlines = [l.strip() for l in open(\".gitignore\").read().splitlines()]\nassert any(l in (\"__pycache__/\", \"__pycache__\", \"**/__pycache__/\", \"**/__pycache__\", \"/__pycache__/\") for l in lines), lines\nassert \"*.log\" in lines, \"existing *.log entry lost\"\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": ".gitignore has a __pycache__ entry and keeps *.log"
+}

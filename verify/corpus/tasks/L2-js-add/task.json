@@ -27,7 +27,7 @@
    "expect": {
     "契約": "PROVEN",
     "申告": {
-     "bug_fixed": "PROVEN"
+     "bug_fixed": "UNVERIFIED"
     }
    }
   },

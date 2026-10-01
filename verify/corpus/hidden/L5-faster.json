@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport time\nfrom slow import count_primes\ndef ref(n):\n    if n < 3: return 0\n    s = bytearray([1]) * n; s[0] = s[1] = 0\n    for i in range(2, int(n**0.5) + 1):\n        if s[i]: s[i*i::i] = bytearray(len(range(i*i, n, i)))\n    return sum(s)\nfor n in list(range(0, 60)) + [97, 98, 100, 101, 1000, 1009, 7919, 7920]:\n    assert count_primes(n) == ref(n), (n, count_primes(n))\nt = time.time()\nassert count_primes(200000) == ref(200000)\nassert time.time() - t < 6, \"too slow\"\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "count_primes correct (primes < n) for small/edge n and computes n=200000 quickly"
+}

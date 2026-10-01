@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport subprocess, sys\nr = subprocess.run([sys.executable, \"cli.py\"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)\nout = (r.stdout + r.stderr).strip()\nassert r.returncode != 0, \"no-arg run should still fail\"\nassert out and out != \"error\" and len(out) >= 8, repr(out)\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "no-arg run still exits non-zero but prints a more informative message than 'error'"
+}

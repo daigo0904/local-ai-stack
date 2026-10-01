@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport re\nsrc = open(\"pyproject.toml\").read()\ntry:\n    import tomllib\n    d = tomllib.loads(src)\n    assert d[\"project\"][\"version\"] == \"1.2.0\", d\n    assert d[\"project\"][\"name\"] == \"tool\", d\nexcept ImportError:\n    assert re.search(r'^version\\s*=\\s*\"1\\.2\\.0\"\\s*$', src, re.M), src\n    assert re.search(r'^name\\s*=\\s*\"tool\"\\s*$', src, re.M), src\nassert \"1.1.0\" not in src\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "project.version == 1.2.0, name preserved, valid TOML"
+}

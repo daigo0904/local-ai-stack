@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nfrom pager import page\ndef ref(items, n, size=10): return items[n*size:(n+1)*size]\nfor N in (0, 1, 9, 10, 11, 25, 30, 47):\n    xs = list(range(100, 100+N))\n    for size in (1, 3, 5, 10, 7):\n        for n in range(0, N//size + 3):\n            assert page(xs, n, size) == ref(xs, n, size), (N, n, size)\n    for n in range(4):\n        assert page(xs, n) == ref(xs, n), (N, n)\nassert page(list(\"abcdefg\"), 1, 3) == list(\"def\")\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "page returns full slices for many sizes/pages, incl. default size and short tail"
+}

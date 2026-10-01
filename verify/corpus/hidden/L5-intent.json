@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport re\nsrc = open(\"login.html\", encoding=\"utf-8\").read().lower()\nassert \"<form\" in src or \"<input\" in src, \"no form\"\nassert re.search(r\"type\\s*=\\s*[\\\"']?password\", src), \"password field missing\"\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "login.html still a login form with a password field (UX quality is human judgement)"
+}

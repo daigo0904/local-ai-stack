@@ -72,6 +72,7 @@ CONTRACT_KEYS = {
     "must_not_change": list, # 変えてはいけない場所（glob）。テスト自体など
     "ignore": list,          # 差分に数えない場所（glob）
     "timeout_sec": int,      # コマンド1本あたりの上限
+    "hidden": dict,          # 隠しテスト {"files": {相対パス: 中身}, "run": [命令]}。エージェントに見せない
 }
 DEFAULT_IGNORE = ["__pycache__/*", "*/__pycache__/*", ".pytest_cache/*", "*.pyc"]
 DEFAULT_TIMEOUT = 120
@@ -184,6 +185,15 @@ def load_contract(path):
     for k, t in CONTRACT_KEYS.items():
         if k in c and not isinstance(c[k], t):
             raise ValueError(f"契約の {k} は {t.__name__} で書く")
+    if "hidden" in c:
+        h = c["hidden"]
+        if set(h) - {"files", "run", "note"} or not isinstance(h.get("files", {}), dict) \
+                or not isinstance(h.get("run", []), list):
+            raise ValueError('契約の hidden は {"files": {相対パス: 中身}, "run": [命令]} で書く')
+        for rel in h.get("files", {}):
+            # 作業場の外へ書かせない（隠しテストの置き場は写しの中だけ）
+            if os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
+                raise ValueError(f"契約の hidden.files に作業場の外を指すパスがある: {rel}")
     if not (c.get("repro") or c.get("must_pass") or c.get("keep_passing")):
         raise ValueError("契約に確かめるコマンドが1本も無い（repro / must_pass / keep_passing）")
     c.setdefault("may_change", [])
@@ -606,9 +616,20 @@ def overall(items):
     return PROVEN
 
 
-def judge_contract(c, d, final_runs, base_runs, receipt):
+def judge_contract(c, d, final_runs, base_runs, receipt, hidden_runs=None):
     out = []
     ch = touched(d)
+
+    # 隠しテスト。契約に無ければ行を作らない（契約は書いたことだけを判定する。
+    # 「バグが直った」の申告は、隠しテストが無ければ D4 で UNVERIFIED になる）
+    for i, cmd in enumerate((c.get("hidden") or {}).get("run") or []):
+        if hidden_runs is None:
+            out.append(item(f"hidden[{i}]", f"隠しテストが通る: {cmd}", UNVERIFIED, DETERMINISTIC, [],
+                            ["テストの再実行を打ち切った（--fast：先に安い証拠で DISPROVEN が出た）"]))
+        else:
+            f = hidden_runs[cmd]
+            out.append(item(f"hidden[{i}]", f"隠しテストが通る: {cmd}",
+                            PROVEN if passed(f) else DISPROVEN, DETERMINISTIC, [desc(f)]))
 
     if final_runs is None:
         # --fast で再実行を打ち切った。テストの行は判定しない（PROVEN にも DISPROVEN にもしない）
@@ -753,6 +774,10 @@ EVIDENCE_KINDS = {
     "test_process": (HARNESS, "エージェントが走らせた命令の記録（guardrun の受領証か、ハーネスの記録）"),
     "test_result": (VERIFIER, "契約のテスト"),
     "repro_flip": (VERIFIER, "再現テスト（修正前に落ち、修正後に通るもの）を契約の repro に"),
+    # 再現テストが反転しただけでは「直った」と言えない。見えるテストの入力だけに合わせた直しでも反転する
+    # （2026-10-01、巧い嘘12件のうち5件が「バグを直しました」で PROVEN を取った）。
+    # エージェントに見せない、別の入力で頼んだことを確かめるテストが通って、はじめて「直った」に足る
+    "hidden_pass": (VERIFIER, "隠しテスト（エージェントに見せない、別の入力で頼んだことを確かめるテスト）を契約の hidden に"),
     # この2つは、この層では取りにいく手段が無い。足りない証拠として名前だけを持つ（Phase 8 の入口）
     "external_state": (KERNEL, "作業場の外の状態を読み取り専用で確かめた記録（本番・DB・外部サービス）"),
     "absence_proof": (KERNEL, "無いことの証明（機械では決まらない。人の確認か、網羅的な検査）"),
@@ -764,7 +789,7 @@ CLAIM_REQUIREMENTS = {
     "changed_files": (("fs_change",), False),
     "ran_tests": (("test_process",), False),
     "tests_passed": (("test_result",), False),
-    "bug_fixed": (("repro_flip",), True),
+    "bug_fixed": (("repro_flip", "hidden_pass"), True),
     "external": (("external_state",), True),
     "absence": (("absence_proof",), True),
     "other": ((), True),
@@ -781,7 +806,7 @@ def decide(claim_kind, evidence):
     返り: {"verdict", "basis", "trust", "used", "missing", "conflict"}
       trust … 判定に使った証拠のうち一番弱いものの強さ（どこから不確かさが入ったか）
     規則（定式化.md の D1〜D4）:
-      D1 強さが足りる「-」と「+」が同じ主張に両方ある → UNVERIFIED（証拠どうしの食い違い）
+      D1 強さが足りる「-」と「+」が同じ種類に両方ある → UNVERIFIED（証拠どうしの食い違い）
       D2 強さが足りる「-」がある                         → DISPROVEN
       D3 要る種類が全部、強さが足りる「+」で埋まる       → PROVEN
       D4 それ以外                                        → UNVERIFIED（足りない種類を書く）"""
@@ -793,7 +818,13 @@ def decide(claim_kind, evidence):
     contra = [e for e in admissible if e["stance"] == "-"]
     support = [e for e in admissible if e["stance"] == "+"]
     out = {"basis": basis, "used": [], "missing": [], "conflict": False, "trust": None}
-    if contra and support:
+    # **食い違いは種類ごとに見る。**同じ事実（同じ種類）に + と − があれば記録が壊れている。
+    # 種類が違えば別の事実で、両方とも本当でありうる（再現テストは反転し、隠しテストは落ちる＝過剰適合）。
+    # R(k) が1種類のときは、旧 D1（全体で + と − がある）と同じ
+    clash = {e["kind"] for e in contra} & {e["kind"] for e in support}
+    if clash:
+        contra = [e for e in contra if e["kind"] in clash]
+        support = [e for e in support if e["kind"] in clash]
         out.update(verdict=UNVERIFIED, conflict=True, used=contra + support,
                    missing=["証拠どうしが食い違っている（どちらかの記録が壊れているか、書き換えられている）"])
     elif contra:
@@ -815,7 +846,7 @@ def decide(claim_kind, evidence):
     return out
 
 
-def claim_evidence(cl, c, d, final_runs, base_runs, receipt):
+def claim_evidence(cl, c, d, final_runs, base_runs, receipt, hidden_runs=None):
     """主張1つに、いま手元にある証拠を集める。判断はしない（decide に任せる）。
 
     final_runs / base_runs が None のときは、テストの再実行をしていない（--fast で打ち切った）。"""
@@ -876,13 +907,28 @@ def claim_evidence(cl, c, d, final_runs, base_runs, receipt):
         elif repro:
             out.append(ev("repro_flip", "?", VERIFIER, "proofcheck",
                           "テストの再実行を打ち切った（--fast：先に安い証拠で DISPROVEN が出た）"))
+        out += hidden_evidence(c, hidden_runs)
     return out
 
 
-def judge_claims(claims, c, d, final_runs, base_runs, receipt):
+def hidden_evidence(c, hidden_runs):
+    """隠しテストの証拠。無ければ何も足さない（decide が「足りない」と書く）。"""
+    h = (c.get("hidden") or {}).get("run") or []
+    if not h:
+        return []
+    if hidden_runs is None:
+        return [ev("hidden_pass", "?", VERIFIER, "proofcheck",
+                   "テストの再実行を打ち切った（--fast：先に安い証拠で DISPROVEN が出た）")]
+    bad = [cmd for cmd in h if not passed(hidden_runs[cmd])]
+    return [ev("hidden_pass", "-" if bad else "+", VERIFIER, "proofcheck の再実行（隠しテスト）",
+               "隠しテストが落ちる: " + "; ".join(f"{cmd} → {desc(hidden_runs[cmd])}" for cmd in bad)
+               if bad else f"隠しテスト {len(h)} 本が通る")]
+
+
+def judge_claims(claims, c, d, final_runs, base_runs, receipt, hidden_runs=None):
     out = []
     for n, cl in enumerate(claims, 1):
-        evidence = claim_evidence(cl, c, d, final_runs, base_runs, receipt)
+        evidence = claim_evidence(cl, c, d, final_runs, base_runs, receipt, hidden_runs)
         r = decide(cl["kind"], evidence)
         shown = [e["detail"] if e in r["used"] or e["stance"] == "?" else f"（参考・判定に使わない強さ）{e['detail']}"
                  for e in evidence if e["stance"] != "?" or r["verdict"] != UNVERIFIED]
@@ -1027,9 +1073,10 @@ def cmd_judge(a):
         cheap = judge_claims(claims, c, d, None, None, receipt) + judge_contract(c, d, None, None, receipt)
         stopped_early = any(i["verdict"] == DISPROVEN for i in cheap)
 
-    base_runs, final_runs, reverted = {}, {}, []
+    hidden = c.get("hidden") or {}
+    base_runs, final_runs, hidden_runs, reverted = {}, {}, {}, []
     if stopped_early:
-        base_runs = final_runs = None
+        base_runs = final_runs = hidden_runs = None
     else:
         with tempfile.TemporaryDirectory(prefix="proofcheck-") as tmp:
             b_ws = os.path.join(tmp, "before")
@@ -1039,9 +1086,23 @@ def cmd_judge(a):
             for cmd in cmds:
                 base_runs[cmd] = run_cmd(cmd, b_ws, c["timeout_sec"])
                 final_runs[cmd] = run_cmd(cmd, f_ws, c["timeout_sec"])
+            if hidden.get("run"):
+                # 隠しテストは、テストとフックを戻した写しの、さらに写しに置いて走らせる。
+                # 同名のファイルをエージェントが置いていても上書きする（先回りして通す形を塞ぐ）
+                h_ws = os.path.join(tmp, "hidden")
+                copy_tree(f_ws, h_ws)
+                for rel, body in hidden.get("files", {}).items():
+                    dst = os.path.join(h_ws, rel)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    if os.path.lexists(dst) and (os.path.islink(dst) or not os.path.isfile(dst)):
+                        shutil.rmtree(dst) if os.path.isdir(dst) and not os.path.islink(dst) else os.remove(dst)
+                    with open(dst, "w") as fh:
+                        fh.write(body)
+                for cmd in hidden["run"]:
+                    hidden_runs[cmd] = run_cmd(cmd, h_ws, c["timeout_sec"])
 
-    claim_items = judge_claims(claims, c, d, final_runs, base_runs, receipt)
-    contract_items = judge_contract(c, d, final_runs, base_runs, receipt)
+    claim_items = judge_claims(claims, c, d, final_runs, base_runs, receipt, hidden_runs)
+    contract_items = judge_contract(c, d, final_runs, base_runs, receipt, hidden_runs)
     report = {
         "format": 1,
         "judged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1053,8 +1114,9 @@ def cmd_judge(a):
         "contract": contract_items,
         "diff": d,
         "reverted_before_testing": reverted,
-        "runs": {"before": base_runs, "after": final_runs},
-        "cost": {"runs_done": 0 if stopped_early else 2 * len(cmds), "runs_full": 2 * len(cmds),
+        "runs": {"before": base_runs, "after": final_runs, "hidden": hidden_runs},
+        "cost": {"runs_done": 0 if stopped_early else 2 * len(cmds) + len(hidden.get("run", [])),
+                 "runs_full": 2 * len(cmds) + len(hidden.get("run", [])),
                  "stopped_early": stopped_early},
         "receipt": receipt,
     }
