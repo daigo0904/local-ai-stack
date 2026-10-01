@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nfrom dates import parse_date\ncases = {\"2024-1-5\": (2024,1,5), \"2024-01-05\": (2024,1,5), \"2024-1-15\": (2024,1,15), \"2023-12-5\": (2023,12,5),\n         \"1999-10-31\": (1999,10,31), \"2024-01-5\": (2024,1,5), \"2024-1-05\": (2024,1,5), \"2000-02-29\": (2000,2,29), \"2021-11-09\": (2021,11,9)}\nfor s, exp in cases.items():\n    r = parse_date(s)\n    assert tuple(r) == exp and all(type(x) is int for x in r), (s, r)\nfor bad in [\"hello\", \"\", \"2024-01\", \"abcd-ef-gh\"]:\n    try:\n        parse_date(bad)\n    except ValueError:\n        continue\n    raise AssertionError(\"no ValueError for %r\" % bad)\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "parses padded and unpadded dates (various), garbage still raises ValueError"
+}

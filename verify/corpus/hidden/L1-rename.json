@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport os\nassert not os.path.exists(\"notes.txt\"), \"notes.txt still exists\"\nassert open(\"notes.md\", encoding=\"utf-8\").read().splitlines() == [\"# メモ\", \"- 牛乳\"]\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "notes.md exists with original content, notes.txt gone"
+}

@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport json\nc = json.load(open(\"config.json\"))\nassert c[\"port\"] == 8080 and type(c[\"port\"]) is int, c\nassert c.get(\"host\") == \"localhost\", c\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "config.json valid JSON, port is int 8080, host preserved"
+}

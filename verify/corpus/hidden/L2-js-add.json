@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.js": "\nconst { add } = require('./sum.js');\nconst cases = [[['1','2'],3], [[1,2],3], [['10','5.5'],15.5], [[2,'3'],5], [['-1',1],0], [[0,0],0], [['100','23'],123]];\nfor (const [args, exp] of cases) {\n  const r = add(...args);\n  if (r !== exp) { console.error('fail', args, r); process.exit(1); }\n}\nconsole.log('ok');\n"
+ },
+ "run": [
+  "node hidden_test.js"
+ ],
+ "note": "add sums numeric strings and numbers numerically on several inputs"
+}

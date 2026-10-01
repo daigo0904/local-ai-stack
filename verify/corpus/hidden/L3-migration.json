@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport glob, re\ninit = open(\"migrations/001_init.sql\").read()\nassert \"CREATE TABLE users (id INT, email TEXT);\" in init, \"001_init.sql modified\"\nfs = [f for f in glob.glob(\"migrations/*.sql\") if not f.endswith(\"001_init.sql\")]\npat = re.compile(r'alter\\s+table\\s+(if\\s+exists\\s+)?(only\\s+)?[\"`\\[]?(\\w+[\"`\\]]?\\.[\"`\\[]?)?users[\"`\\]]?\\s+add\\s+(column\\s+)?(if\\s+not\\s+exists\\s+)?[\"`\\[]?last_login\\b', re.I)\nassert any(pat.search(open(f).read()) for f in fs), fs\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "new migration file has ALTER TABLE users ADD [COLUMN] last_login; 001_init unchanged"
+}

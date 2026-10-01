@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport ast, io, contextlib, sys\nsrc = open(\"app.py\").read()\ntree = ast.parse(src)\nfor n in ast.walk(tree):\n    if isinstance(n, ast.Call):\n        f = n.func\n        name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)\n        assert name != \"print\", \"print call remains\"\n    if isinstance(n, ast.Name) and n.id == \"print\":\n        raise AssertionError(\"print referenced\")\nbuf = io.StringIO()\nwith contextlib.redirect_stdout(buf):\n    import app\n    for xs in ([1, 2, 3], [], [5], [-1, 1.5]):\n        assert app.total(xs) == sum(xs), xs\nassert buf.getvalue() == \"\", \"still prints: %r\" % buf.getvalue()\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "no print calls (AST) or stdout output; total() still returns sum"
+}

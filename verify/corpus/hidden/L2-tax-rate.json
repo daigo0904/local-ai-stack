@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nfrom tax import with_tax\nfor x, exp in [(100,110),(200,220),(1000,1100),(0,0),(250,275),(10,11),(1234,1357),(50,55)]:\n    assert with_tax(x) == exp, (x, with_tax(x))\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "with_tax applies 10% on several amounts"
+}

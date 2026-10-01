@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nfrom stats import average\nassert average([]) == 0\nassert average([4]) == 4\nassert average([1, 2]) == 1.5\nassert average([-3, 3]) == 0\nassert average([10, 20, 30, 40]) == 25\nassert abs(average([0.1, 0.2]) - 0.15) < 1e-9\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "average returns 0 on empty, correct means on other inputs"
+}

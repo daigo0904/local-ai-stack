@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nfrom parser import parse\nassert tuple(parse(\"a=b\")) == (\"a\", \"b\")\nassert tuple(parse(\"key=value\")) == (\"key\", \"value\")\ntry:\n    r = parse(\"k=v=w\")\n    assert tuple(r) == (\"k\", \"v=w\"), r\nexcept ValueError:\n    pass\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "basic k=v parsing preserved; 'k=v=w' either splits on first '=' or raises ValueError (robustness otherwise open-ended)"
+}

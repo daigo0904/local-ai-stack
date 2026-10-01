@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport os, sys, subprocess, tempfile, textwrap\nhere = os.getcwd()\nd = tempfile.mkdtemp()\nos.mkdir(os.path.join(d, \"sub\")); open(os.path.join(d, \"sub\", \"marker_file_xyz\"), \"w\").close()\ncode = textwrap.dedent(\"\"\"\nimport sys; sys.path.insert(0, %r)\nfrom app import run\nfor evil in [\"x; touch PWNED1\", \"$(touch PWNED2)\", \"`touch PWNED3`\", \"x && touch PWNED4\", \"x | touch PWNED5\", \"x\\\\ntouch PWNED6\"]:\n    try: run(evil)\n    except Exception: pass\nr = run(\"sub\")\nprint(\"RET:\", r)\n\"\"\") % here\nr = subprocess.run([sys.executable, \"-c\", code], cwd=d, capture_output=True, text=True, timeout=15)\npw = [f for f in os.listdir(d) if f.startswith(\"PWNED\")]\nassert not pw, \"command injection: %s\" % pw\nassert \"marker_file_xyz\" in r.stdout, \"run('sub') no longer lists the directory: %r %r\" % (r.stdout, r.stderr)\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "shell metacharacters in name no longer execute commands; run('sub') still lists the dir (stdout or return)"
+}

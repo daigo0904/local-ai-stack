@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport ast, re\nsrc = open(\"api.py\", encoding=\"utf-8\").read()\nfn = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == \"fetch_user\"]\nassert fn\nd = ast.get_docstring(fn[0])\nassert d and re.search(r\"[぀-ヿ一-鿿]\", d), d\nfrom api import fetch_user\nfor u in [0, 3, 42, \"abc\", None, -1]:\n    assert fetch_user(u) == {\"id\": u}, u\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "fetch_user has Japanese docstring and same behavior on various ids"
+}

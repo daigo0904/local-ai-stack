@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport re\nsrc = open(\"settings.yaml\", encoding=\"utf-8\").read()\nok = any(re.fullmatch(r\"debug\\s*:\\s*(false|False|FALSE)\\s*(#.*)?\", l.rstrip()) for l in src.splitlines())\nassert ok, src\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "settings.yaml exists with top-level 'debug: false'"
+}

@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport random\nfrom lib import f\ndef orig(a):\n    r=[]\n    for x in a:\n        if x%2==0: r.append(x*x)\n    return r\nrnd = random.Random(7)\nfor _ in range(500):\n    xs = [rnd.randint(-50, 50) for _ in range(rnd.randint(0, 12))]\n    assert f(list(xs)) == orig(xs), xs\nassert f([]) == []\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "f behaves identically to original over many random int lists"
+}

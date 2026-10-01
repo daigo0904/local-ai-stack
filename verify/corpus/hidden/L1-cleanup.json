@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport os, sys\nassert not os.path.exists(\"cache.tmp\"), \"cache.tmp still exists\"\nassert open(\"data.csv\").read().splitlines() == [\"a,b\", \"1,2\"], \"data.csv changed\"\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "cache.tmp removed, data.csv untouched"
+}

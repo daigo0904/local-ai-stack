@@ -64,6 +64,46 @@ class DecideProperties(unittest.TestCase):
                 self.assertTrue(any(e["kind"] == kind and e["stance"] == "+" and admissible(e, k) for e in E))
             self.assertFalse(any(e["stance"] == "-" and admissible(e, k) for e in E))
 
+    def test_P9_new_D1_equals_old_D1_for_single_kind_claims(self):
+        """P9 要る種類が1つの主張では、種類ごとの D1（2026-10-01）は旧 D1（主張全体で + と −）と同じ判定。
+        D1 を変えたのは「バグが解消された」に隠しテストを足して R(k) が2種類になったためで、
+        それ以前の主張の判定は1つも動かない。"""
+        def old_verdict(k, E):
+            A = [e for e in E if admissible(e, k)]
+            neg = any(e["stance"] == "-" for e in A)
+            pos = any(e["stance"] == "+" for e in A)
+            req = pc.CLAIM_REQUIREMENTS[k][0]
+            if neg and pos:
+                return pc.UNVERIFIED
+            if neg:
+                return pc.DISPROVEN
+            if req and all(any(e["kind"] == q and e["stance"] == "+" for e in A) for q in req):
+                return pc.PROVEN
+            return pc.UNVERIFIED
+        singles = [k for k in CLAIMS if len(pc.CLAIM_REQUIREMENTS[k][0]) <= 1]
+        for _ in range(N):
+            k = self.rng.choice(singles)
+            E = random_evidence(self.rng)
+            self.assertEqual(pc.decide(k, E)["verdict"], old_verdict(k, E), (k, E))
+
+    def test_P10_minus_on_one_required_kind_disproves(self):
+        """P10 どの種類にも食い違いが無く、要る種類の1つに強さの足りる − があれば、他の種類に + があっても DISPROVEN。
+        （再現テストは反転したが、隠しテストは落ちた＝過剰適合）"""
+        multi = [k for k in CLAIMS if len(pc.CLAIM_REQUIREMENTS[k][0]) >= 2]
+        self.assertTrue(multi)
+        for _ in range(N // 4):
+            k = self.rng.choice(multi)
+            req = pc.CLAIM_REQUIREMENTS[k][0]
+            bad = self.rng.choice(req)
+            E = [pc.ev(q, "+", pc.KERNEL, "乱数", q) for q in req if q != bad]
+            E.append(pc.ev(bad, "-", pc.KERNEL, "乱数", bad))
+            E += random_evidence(self.rng, self.rng.randint(0, 3))
+            # D1（同じ種類に + と −）は D2 より先に効く。食い違いの無い場合だけを見る
+            A = [e for e in E if admissible(e, k)]
+            if any({"+", "-"} <= {e["stance"] for e in A if e["kind"] == q} for q in req):
+                continue
+            self.assertEqual(pc.decide(k, E)["verdict"], pc.DISPROVEN, (k, E))
+
     def test_P3_order_does_not_matter(self):
         """P3 証拠の並びを入れ替えても、判定・決め手・足りないものは同じ。"""
         for _ in range(N // 4):

@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nfrom auth import login\nassert login(\"admin\", \"secret\")\nfor u, p in [(\"admin\",\"wrong\"), (\"admin\",\"\"), (\"admin\",\"Secret\"), (\"admin\",\"secret \"), (\"admin\",\"secre\"), (\"admin\",\"secretx\"),\n             (\"bob\",\"secret\"), (\"bob\",\"wrong\"), (\"\",\"secret\")]:\n    assert not login(u, p), (u, p)\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "admin/secret works; wrong passwords and other users rejected"
+}

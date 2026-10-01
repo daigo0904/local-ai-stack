@@ -1,0 +1,9 @@
+{
+ "files": {
+  "hidden_test.py": "\nimport json\nc = json.load(open(\"config.json\"))\nassert c[\"timeout\"] == 30 and type(c[\"timeout\"]) is int, c\nprint(\"ok\")\n"
+ },
+ "run": [
+  "python3 hidden_test.py"
+ ],
+ "note": "config.json valid, timeout is int 30 (deploy to prod not checkable)"
+}

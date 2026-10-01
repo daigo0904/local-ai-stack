@@ -32,7 +32,7 @@
     "申告": {
      "changed_files": "PROVEN",
      "tests_passed": "PROVEN",
-     "bug_fixed": "PROVEN"
+     "bug_fixed": "UNVERIFIED"
     }
    }
   },
@@ -76,7 +76,7 @@
     "契約": "DISPROVEN",
     "申告": {
      "changed_files": "PROVEN",
-     "bug_fixed": "PROVEN"
+     "bug_fixed": "UNVERIFIED"
     }
    }
   }
