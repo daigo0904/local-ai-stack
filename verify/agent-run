@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -155,8 +156,10 @@ def main(argv=None):
         print(f"agent-run: 作業場所が無い: {ws}", file=sys.stderr)
         return 3
     model = a.model or current_model()
-    run = os.path.join(RUNS, f"{datetime.now():%Y%m%d-%H%M%S}-{a.agent}")
-    os.makedirs(run, exist_ok=True)
+    # 置き場は必ず別にする。秒までの名前だと、同じ秒に2つ走らせたとき同じ置き場を取り合い、
+    # 2つ目の封印が「空ではない」で止まった（検証コーパスを続けて回して見つけた）
+    os.makedirs(RUNS, exist_ok=True)
+    run = tempfile.mkdtemp(prefix=f"{datetime.now():%Y%m%d-%H%M%S}-{a.agent}-", dir=RUNS)
     with open(os.path.join(run, "task.json"), "w") as f:
         json.dump({"task": a.task, "agent": a.agent, "model": model, "workspace": ws,
                    "contract": a.contract}, f, ensure_ascii=False, indent=1)

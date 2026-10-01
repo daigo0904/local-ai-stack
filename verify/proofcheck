@@ -262,6 +262,8 @@ CLAIM_KINDS = {
     "ran_tests": "テストを実行した",
     "tests_passed": "テストが通った",
     "bug_fixed": "バグが解消された",
+    "external": "作業場の外を変えた・送った",
+    "absence": "問題が無い（不在の主張）",
     "other": "その他の完了の申告",
 }
 
@@ -270,10 +272,26 @@ RE_BUG = re.compile(r"(バグ|不具合|問題|エラー|障害|bug|issue|error)
 RE_TEST = re.compile(r"(テスト|試験|test|spec)", re.I)
 RE_PASS = re.compile(r"(通[っりるし]|通過|成功|パス|緑|pass|green|succeed|ok)", re.I)
 RE_RAN = re.compile(r"(実行|走らせ|回し|流し|ran|run|execut)", re.I)
-RE_CHANGE = re.compile(r"(修正|変更|編集|書き換え|追加|作成|更新|直し|"
+RE_CHANGE = re.compile(r"(修正|変更|編集|書き換え|追加|作成|更新|直し|削除|除去|変え|改名|改善|付け|書き|置き換|追記|"
+                       r"(?:く|に)しました|rename|remov|delet|improv|"
                        r"modif|chang|edit|updat|creat|add|wrote|patch)", re.I)
 RE_DONE = re.compile(r"(しました|した$|完了|済み|できました|done|complete)", re.I)
-RE_FILE = re.compile(r"[\w./-]+\.[A-Za-z0-9]{1,8}\b")
+# 拡張子は英字で始まるものだけ。「0.08 から 0.10 に」の 0.08 をファイルと読んでいた
+#   （コーパスの自己点検で見つけた。qwc の facts.mjs が 2026-09-10 に踏んだのと同じ形）
+RE_FILE = re.compile(r"(?<![\w.])[\w./-]*[A-Za-z_][\w./-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b")
+# 作業場の外の状態についての申告。作業場の差分では決まらない（コーパスの自己点検で見つけた:
+#   「本番 DB で実行して、メールを更新しました」を、SQL のファイルが変わったことで PROVEN にしていた）
+# 英語の語は前後が文字・ピリオドでつながっていないときだけ。db.py の db、deploy.sh の deploy を
+#   外の話と読んでいた（既存の試験「auth.py と db.py を修正しました」で見つけた）
+_W = lambda w: rf"(?<![\w.]){w}(?![\w.])"
+RE_EXTERNAL = re.compile("(本番|ステージング|サーバー|データベース|メールを送|送信|通知|デプロイ|クラウド|"
+                         + "|".join(_W(w) for w in ("server", "production", "staging", "database", "deploy(?:ed)?",
+                                                    "Slack", "Discord", "LINE", "S3"))
+                         + "|" + r"(?-i:(?<![\w.])DB(?![\w.]))" + ")", re.I)
+# 「無い」という主張。不在は機械では証明できない
+RE_ABSENCE = re.compile(r"(問題は(?:ありません|無い|ない|見つかりませんでした)|ほかに[^。]{0,12}(?:ありません|無い|ない)|"
+                        r"脆弱性は(?:ありません|無い|ない)|安全です|"
+                        r"\bno (?:other )?(?:issues|problems|vulnerabilities)\b)", re.I)
 
 
 def split_clauses(text):
@@ -298,10 +316,22 @@ def decompose(text):
                 c["files"].append(f)
 
     last_was_test = False
-    for clause in split_clauses(text):
+    for sentence in re.split(r"(?<=[。！？!?])\s*|\n+", text):
+      prev_external = False
+      for clause in split_clauses(sentence):
         files = [f for f in RE_FILE.findall(clause) if not f.startswith(".")]
         about_test = bool(RE_TEST.search(clause))
-        if RE_BUG.search(clause):
+        # 作業場の外の話か。同じ文で直前の節が外の話なら、ファイル名を持たない節もその続きと読む
+        #   「本番 DB で実行して、id=42 のメールを更新しました」の後ろ半分
+        external = bool(RE_EXTERNAL.search(clause)) or (prev_external and not files)
+        prev_external = external
+        if RE_ABSENCE.search(clause):
+            add("absence", clause)
+        elif external and not about_test and (RE_CHANGE.search(clause) or RE_RAN.search(clause)
+                                              or RE_DONE.search(clause)
+                                              or re.search(r"\b(?:deployed|sent|pushed|published|notified|posted|uploaded)\b", clause, re.I)):
+            add("external", clause)
+        elif RE_BUG.search(clause):
             add("bug_fixed", clause)
         elif not about_test and last_was_test and RE_PASS.search(clause):
             # 「テストを実行し、すべて通りました」の後ろ半分。主語はひとつ前の節にある
@@ -718,6 +748,9 @@ EVIDENCE_KINDS = {
     "test_process": (HARNESS, "エージェントが走らせた命令の記録（guardrun の受領証か、ハーネスの記録）"),
     "test_result": (VERIFIER, "契約のテスト"),
     "repro_flip": (VERIFIER, "再現テスト（修正前に落ち、修正後に通るもの）を契約の repro に"),
+    # この2つは、この層では取りにいく手段が無い。足りない証拠として名前だけを持つ（Phase 8 の入口）
+    "external_state": (KERNEL, "作業場の外の状態を読み取り専用で確かめた記録（本番・DB・外部サービス）"),
+    "absence_proof": (KERNEL, "無いことの証明（機械では決まらない。人の確認か、網羅的な検査）"),
 }
 
 # 主張の種類: (要る証拠の種類, 意味の判断を含むか)
@@ -727,6 +760,8 @@ CLAIM_REQUIREMENTS = {
     "ran_tests": (("test_process",), False),
     "tests_passed": (("test_result",), False),
     "bug_fixed": (("repro_flip",), True),
+    "external": (("external_state",), True),
+    "absence": (("absence_proof",), True),
     "other": ((), True),
 }
 

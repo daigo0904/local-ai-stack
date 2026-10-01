@@ -173,6 +173,7 @@ OpenShell の記録に、壁の中で走った1本1本の命令とファイル�
 python3 verify/test_proofcheck.py
 python3 verify/test_agent_run.py
 python3 verify/test_theory.py      # 判定の核の性質（P1〜P8）と定理 F
+verify/run_corpus --self-check      # 検証コーパス（5段・15課題）の自己点検。corpus/README.md
 ```
 
 実際に見つかった食い違いを小さな作業場で再現している:
