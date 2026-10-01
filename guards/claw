@@ -10,6 +10,9 @@ claw — OpenClaw をターミナルから立ち上げる。
     claw chat       ターミナルでそのまま話す
     claw ui         ブラウザの管理画面を開く
     claw fix        LINE の入り口を点検して直す
+    claw run …      エージェント（qwc / Codex）に頼み、記録を残し、契約があれば判定する
+                    例: claw run --agent codex --contract login.json "ログインバグを直して"
+                    中身は ~/bin/agent-run（verify/）。引数はそのまま渡す
 
 立ち上げるもの:
   ollama       … 頭脳。設定で選んだモデルを動かす。落ちていれば起こす
@@ -378,6 +381,23 @@ def cmd_ui():
     return subprocess.run(["openclaw", "dashboard"]).returncode
 
 
+def cmd_run():
+    """頼む前に頭脳（ollama）が起きているか確かめ、あとは agent-run に任せる。
+
+    qwc も Codex（--oss）もこの Mac の ollama で考えるので、落ちていれば何もできない。
+    判定の中身はここに持たない。claw は入り口で、判断は verify/ の側にある。"""
+    runner = os.path.expanduser("~/bin/agent-run")
+    if not os.path.exists(runner):
+        print("agent-run が入っていない。./install verify で入れる。")
+        return 1
+    if not ollama_up():
+        print("ollama が動いていないので、先に起こす。")
+        start_ollama()
+        if not wait_for(ollama_up, 30, "ollama"):
+            return 1
+    return subprocess.run([runner, *sys.argv[2:]]).returncode
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "start"
     table = {
@@ -394,6 +414,7 @@ def main():
         "ui": cmd_ui,
         "fix": cmd_fix,
         "dashboard": cmd_ui,
+        "run": cmd_run,
     }
     if cmd in ("-h", "--help", "help"):
         print(__doc__.strip())

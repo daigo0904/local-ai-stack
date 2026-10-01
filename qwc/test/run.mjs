@@ -2299,6 +2299,71 @@ console.log('\n出はじめたあとに黙り込んでも取りこぼさない')
   slow.close();
 }
 
+// ── 走った記録（--events） ────────────────────────────────
+//
+// 「テストを実行しました」が本当かは、モデルの文からは分からない。
+// 道具が実際に何を走らせ、どう終わったかを codex exec --json と同じ形で残し、
+// verify/proofcheck がそれを読む。ここでは「モデルの文ではなく道具の事実が残る」ことを固定する。
+console.log('\n走った記録を codex exec --json の形で残す');
+{
+  const { createEventLog } = await import('../src/events.mjs');
+
+  class ScriptedAgent extends Agent {
+    constructor(opts) {
+      super(opts);
+      this.step = 0;
+    }
+    async streamAssistant() {
+      this.step++;
+      if (this.step === 1) {
+        return {
+          message: { role: 'assistant', content: '' },
+          toolCalls: [
+            { name: 'run_command', args: { command: 'echo half; exit 3' }, id: 'c1' },
+            { name: 'write_file', args: { path: 'fixed.txt', content: 'ok\n' }, id: 'c2' }
+          ],
+          stats: null
+        };
+      }
+      // 実際は落ちたのに「通りました」と言う
+      return { message: { role: 'assistant', content: 'テストを実行し、すべて通りました。' }, toolCalls: [], stats: null };
+    }
+  }
+
+  const logFile = path.join(os.tmpdir(), `qwc-events-${process.pid}.jsonl`);
+  const agent = new ScriptedAgent({
+    config: { ...baseConfig(), autoApprove: true, isSubagent: true, maxSteps: 4 },
+    root,
+    permissions: new PermissionManager({ ...baseConfig(), autoApprove: true }, async () => 'y')
+  });
+  agent.events = createEventLog(logFile);
+  agent.events.threadStarted('t-1');
+  await agent.runTurn('テストを直して');
+
+  const events = fs.readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const types = events.map((e) => e.type);
+  const items = events.filter((e) => e.type === 'item.completed').map((e) => e.item);
+  const cmd = items.find((i) => i.type === 'command_execution');
+  const change = items.find((i) => i.type === 'file_change');
+  const said = items.find((i) => i.type === 'agent_message');
+
+  check('始まりと終わりが Codex と同じ名前で出る',
+    types[0] === 'thread.started' && types[1] === 'turn.started' && types.at(-1) === 'turn.completed', types.join(','));
+  check('走らせた命令と本当の終了コードが残る',
+    cmd && cmd.command === 'echo half; exit 3' && cmd.exit_code === 3 && cmd.status === 'failed', JSON.stringify(cmd));
+  check('出力も残る', cmd && cmd.aggregated_output.includes('half'));
+  check('書いたファイルが file_change として残る',
+    change && change.changes[0].path === 'fixed.txt' && change.changes[0].kind === 'add', JSON.stringify(change));
+  check('モデルの最後の発言も残る（突き合わせる相手）', said && said.text.includes('通りました'));
+  check('item の id は重ならない', new Set(items.map((i) => i.id)).size === items.length);
+  check('usage は Codex と同じ欄を持つ', 'input_tokens' in events.at(-1).usage && 'output_tokens' in events.at(-1).usage);
+
+  // 2回目は前の記録に混ざらない
+  createEventLog(logFile);
+  check('作り直すとまっさらになる', fs.readFileSync(logFile, 'utf8') === '');
+  fs.rmSync(logFile, { force: true });
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(`\n合計: ${passed} 件成功 / ${failed} 件失敗\n`);

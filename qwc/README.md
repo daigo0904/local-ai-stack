@@ -69,6 +69,8 @@ qwc -p "README のタイポを直して" --yolo
 
 `-p` では確認に答えられないため、書き換えまで任せるなら `--yolo` が要ります。
 
+`--events <file>` を付けると、道具が実際に走らせた命令と終了コード・書いたファイル・最後の発言を、OpenAI の [Codex](https://github.com/openai/codex) の `codex exec --json` と同じ形の JSONL で残します。「テストを通しました」という報告を、[`verify/proofcheck`](../verify) がこの記録と突き合わせます。記録は作業フォルダの外に置いてください（中に置くと、モデルが書き換えられます）。
+
 ## 安全のしくみ
 
 自律的に動くものなので、勝手に壊さないための歯止めを3つ入れてあります。
@@ -143,6 +145,7 @@ qwc -p "README のタイポを直して" --yolo
 
 ```
 -p, --print <文>       一回だけ実行して終了
+    --events <file>    -p の走りを codex exec --json と同じ形の JSONL で残す
 -m, --model <名前>     使うモデル（既定: gemma4:26b）
     --host <URL>       Ollama の場所（既定: http://localhost:11434）
     --ctx <数>         文脈の広さ（既定: 32768）

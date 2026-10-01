@@ -6,6 +6,7 @@ proofcheck — エージェントの「できました」を、実行の証拠�
     （ここでエージェントが DIR で仕事をする。guardrun の中で走らせる）
     proofcheck judge RUNDIR --claim "ファイルを修正し、テストを実行し、バグを直しました"
                      [--claim-file FILE] [--receipt RECEIPT.json] [--seal-id SHA]
+                     [--codex-jsonl EVENTS.jsonl]
 
 ## 何をするか
 
@@ -336,8 +337,67 @@ def load_receipt(path):
     無い項目は「その証拠は無い」として扱い、推測で埋めない。"""
     with open(path) as f:
         r = json.load(f)
-    return {"processes": r.get("processes"), "outside_changes": r.get("outside_changes"),
+    return {"source": "guardrun の受領証",
+            "processes": r.get("processes"), "outside_changes": r.get("outside_changes"),
             "mark": r.get("mark"), "exit_code": r.get("exit_code")}
+
+
+# ── ハーネスの記録（codex exec --json の形）の取り込み口 ─────────
+
+def load_codex_events(path):
+    """`codex exec --json` が出す JSONL から、走った命令と最後の発言を取り出す。
+
+    形は openai/codex の codex-rs/exec/src/exec_events.rs に従う。
+    qwc も `qwc -p ... --events FILE` で同じ形を書くので、どちらの記録も読める。
+
+    これはハーネス（Codex や qwc）が自分で見た事実で、モデルの文よりは強いが、
+    カーネルの記録ほど強くはない。作業場の中に置かれた記録はモデルが書き換えられるので、
+    記録は作業場の外に書かせること。作業場の外の変化はここからは分からない。"""
+    commands, agent_text, failed = [], None, False
+    with open(path) as f:
+        for row in f:
+            row = row.strip()
+            if not row:
+                continue
+            try:
+                ev = json.loads(row)
+            except ValueError:
+                continue
+            if ev.get("type") in ("turn.failed", "error"):
+                failed = True
+            if ev.get("type") != "item.completed":
+                continue
+            it = ev.get("item") or {}
+            if it.get("type") == "command_execution" and it.get("status") != "declined":
+                commands.append({"command": str(it.get("command", "")),
+                                 "exit_code": it.get("exit_code"), "status": it.get("status")})
+            elif it.get("type") == "agent_message":
+                agent_text = it.get("text", "")
+    return {"source": "ハーネスの記録（codex exec --json の形）",
+            "processes": [split_command(cm["command"]) for cm in commands],
+            "commands": commands, "outside_changes": None,
+            "agent_message": agent_text, "turn_failed": failed}
+
+
+def split_command(command):
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def merge_evidence(receipt, harness):
+    """受領証（カーネル側）を優先し、無い項目だけハーネスの記録で埋める。"""
+    if not receipt:
+        return harness
+    if not harness:
+        return receipt
+    out = dict(harness)
+    for k, v in receipt.items():
+        if v is not None:
+            out[k] = v
+    out["source"] = receipt["source"] if receipt.get("processes") is not None else harness["source"]
+    return out
 
 
 # ── 判定 ────────────────────────────────────────────────
@@ -444,20 +504,27 @@ def judge_claims(claims, c, d, final_runs, base_runs, receipt):
             procs = receipt.get("processes") if receipt else None
             if procs is None:
                 out.append(item(ident, text, UNVERIFIED, DETERMINISTIC, [],
-                                ["エージェントが走らせた命令の記録（guardrun の受領証）"]))
+                                ["エージェントが走らせた命令の記録（guardrun の受領証か、ハーネスの記録）"]))
             else:
                 hit = [p for p in procs if looks_like_test(p, test_cmds)]
                 out.append(item(ident, text, PROVEN if hit else DISPROVEN, DETERMINISTIC,
-                                [f"受領証の命令 {len(procs)} 本のうちテストらしきもの {len(hit)} 本"]))
+                                [f"{receipt['source']}: 命令 {len(procs)} 本のうちテストらしきもの {len(hit)} 本"]))
         elif k == "tests_passed":
             if not test_cmds:
                 out.append(item(ident, text, UNVERIFIED, DETERMINISTIC, [], ["契約のテスト"]))
                 continue
             fails = [cmd for cmd in test_cmds if not passed(final_runs[cmd])]
-            out.append(item(ident, text, DISPROVEN if fails else PROVEN, DETERMINISTIC,
-                            [f"テストとフックを元に戻して proofcheck が走らせた: "
-                             + ("; ".join(f"{cmd} → {desc(final_runs[cmd])}" for cmd in fails)
-                                if fails else f"{len(test_cmds)} 本とも通った")]))
+            ev = [f"テストとフックを元に戻して proofcheck が走らせた: "
+                  + ("; ".join(f"{cmd} → {desc(final_runs[cmd])}" for cmd in fails)
+                     if fails else f"{len(test_cmds)} 本とも通った")]
+            # エージェント自身の最後のテスト実行がどう終わったか。申告との食い違いがここで見える
+            own = [cm for cm in (receipt or {}).get("commands") or []
+                   if looks_like_test(split_command(cm["command"]), test_cmds)]
+            if own:
+                last = own[-1]
+                ev.append(f"{receipt['source']}: エージェントの最後のテスト実行 `{last['command']}` → "
+                          f"終了コード {last['exit_code']}")
+            out.append(item(ident, text, DISPROVEN if fails else PROVEN, DETERMINISTIC, ev))
         elif k == "bug_fixed":
             repro = c.get("repro", [])
             if not repro:
@@ -489,12 +556,15 @@ def looks_like_test(argv, test_cmds):
     契約のコマンドとは、プログラムの場所（/usr/bin/python3 と python3）を問わず、
     引数が同じなら同じと見なす。"""
     args = list(argv[1:])
+    joined = " ".join(argv)
     for cmd in test_cmds:
+        # Codex は命令を `bash -lc '…'` で包むことがある。包まれた中身でも当てる
+        if " ".join(shlex.split(cmd)) in joined:
+            return True
         want = shlex.split(cmd)
         if want and os.path.basename(want[0]) == os.path.basename(argv[0] if argv else "") \
                 and want[1:] == args:
             return True
-    joined = " ".join(argv)
     return bool(re.search(r"\b(pytest|unittest|jest|vitest|mocha|npm (run )?test|go test|cargo test)\b"
                           r"|(^|[\s/])test[_\w]*\.(py|js|mjs|ts)\b", joined))
 
@@ -567,7 +637,11 @@ def cmd_judge(a):
             claim_text = f.read()
     else:
         claim_text = a.claim or ""
-    receipt = load_receipt(a.receipt) if a.receipt else None
+    harness = load_codex_events(a.codex_jsonl) if a.codex_jsonl else None
+    if not claim_text and harness and harness.get("agent_message"):
+        # 申告を渡されなければ、ハーネスに残ったエージェントの最後の発言を申告として読む
+        claim_text = harness["agent_message"]
+    receipt = merge_evidence(load_receipt(a.receipt) if a.receipt else None, harness)
 
     c = seal["contract"]
     ws = seal["workspace"]
@@ -648,6 +722,7 @@ def main(argv=None):
     g.add_argument("--claim", help="エージェントの申告（完了報告の文）")
     g.add_argument("--claim-file")
     j.add_argument("--receipt", help="guardrun の受領証（JSON）")
+    j.add_argument("--codex-jsonl", help="codex exec --json（または qwc --events）の記録。--claim が無ければ最後の発言を申告に使う")
     j.add_argument("--seal-id", help="seal が出した封印ID。違えば判定しない")
     j.add_argument("--json", action="store_true")
     a = p.parse_args(argv)

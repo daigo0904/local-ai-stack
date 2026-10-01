@@ -88,6 +88,36 @@ proofcheck judge ~/.proofcheck/run-001 --seal-id <封印ID> \
   書かせない場所）に置き、封印IDを `--seal-id` で渡す。違えば判定しない
 - テストの中身の正しさ。proofcheck は終了コードしか見ない
 
+## Codex のハーネスとつなぐ（agent-run・claw run）
+
+OpenAI が [openai/codex](https://github.com/openai/codex) で公開しているハーネス
+（`codex exec`）は、走らせた命令と終わり方を `--json` で JSONL に出す。
+qwc も `qwc -p … --events FILE` で同じ形を書くようにした。
+proofcheck は `--codex-jsonl` でこの記録を読み、エージェントの最後の発言を申告として使う。
+
+```sh
+# Codex に頼む（外の API に出ず、この Mac の ollama で動かす）
+claw run --agent codex --contract login.json "ログインバグを直して"
+# qwc に頼む
+claw run --contract login.json "ログインバグを直して"
+```
+
+`claw run` は ollama が起きているか確かめてから `agent-run` に任せる。`agent-run` は
+封印 → 実行 → 判定を通し、記録を `~/.openclaw/runs/<日時>-<エージェント>/` に置く。
+Codex は `codex exec --oss --local-provider ollama --sandbox workspace-write --json` で走らせる。
+
+| 記録から分かること | 分からないこと |
+| --- | --- |
+| 走らせた命令と終了コード（「テストを実行した」の証拠） | 作業場の外の変化（受領証が要る） |
+| エージェント自身の最後のテスト実行がどう終わったか | 記録そのものが書き換えられていないこと |
+
+記録はハーネス（Codex や qwc）が自分で見た事実で、モデルの文よりは強いが、
+カーネルの記録ほど強くはない。だから受領証と両方あるときは受領証を優先する。
+記録は作業場の外に書かせる（agent-run はそうしている）。
+
+まだ確かめていないこと: 本物の `codex` を ollama の gemma4 で動かすこと。
+試験（`verify/test_agent_run.py`）は、本物と同じ引数を受け取り同じ形の記録を出す偽物で通している。
+
 ## 受領証（guardrun）とのつなぎ
 
 `--receipt` は、いまは次の仮の形を受け取る。**guardrun の受領証の本当の形式には
@@ -107,6 +137,7 @@ proofcheck judge ~/.proofcheck/run-001 --seal-id <封印ID> \
 
 ```sh
 python3 verify/test_proofcheck.py
+python3 verify/test_agent_run.py
 ```
 
 実際に見つかった食い違いを小さな作業場で再現している:
