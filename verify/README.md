@@ -120,18 +120,25 @@ Codex は `codex exec --oss --local-provider ollama --sandbox workspace-write --
 
 ## 受領証（guardrun）とのつなぎ
 
-`--receipt` は、いまは次の仮の形を受け取る。**guardrun の受領証の本当の形式には
-まだ合わせていない**（guardrun はこのリポジトリに入っていないため）。
+`--receipt` に guardrun の受領証（`~/.guardrun/runs/<id>/受領証.json`、または
+`guardrun.py <作業場> <命令…>` が最後に出す JSON）をそのまま渡す。形式版2 の
+`期待`・`事後.照合` があれば report.json に残す。
 
-```json
-{"mark": "緑", "exit_code": 0,
- "processes": [["python3", "test_login.py"]],
- "outside_changes": 0}
-```
+| 受領証から言えること | 契約の行 |
+| --- | --- |
+| 判定が緑・青・赤・失敗（壁の内側で最後まで見届けた）なら、作業場の外への書き込みは壁が断っている | `outside` を PROVEN（**測った数ではなく壁の保証**。古いカーネルや Windows では境界が狭い） |
+| 判定そのもの | `guardrun_mark`：緑・青 → PROVEN、赤 → DISPROVEN、失敗・中断・拒否 → UNVERIFIED |
+| 受領証の差分 | `two_diffs`：proofcheck の封印からの差分と突き合わせる。食い違えば DISPROVEN（どちらかが間違っている） |
 
-無い項目は「その証拠は無い」として扱い、推測で埋めない。
-受領証の実物から上の形へ写す変換を書けば、「テストを実行した」と
-「作業場の外を変えていない」が UNVERIFIED から PROVEN / DISPROVEN に動く。
+**受領証に、壁の中で走った1本1本の命令は無い。**受領証の「命令」はエージェント全体を
+起動した1本だけなので、「テストを実行した」の証拠にはならない。そちらは `--codex-jsonl`
+（ハーネスの記録）が担う。両方渡すと、申告も契約も全部が PROVEN になりうる。
+
+受領証の作業場が封印した作業場と違えば、判定しない（別の走りの差分で採点しないため）。
+
+まだできていないこと: `agent-run` を guardrun の壁の中で走らせること。壁は作業場の外への
+書き込みを断るので、エージェントの手が届かない場所にハーネスの記録を書けない。
+guardrun に「記録の書き出し先」を足す変更が要る。
 
 ## 試験
 

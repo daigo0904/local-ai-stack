@@ -307,6 +307,97 @@ class TestCodexEvents(Case):
         self.assertEqual(h["agent_message"], "テストを実行し、すべて通りました。")
 
 
+class TestGuardrunReceipt(Case):
+    """guardrun の受領証の実物の形（guardrun.py 受領証を残す・run の戻り値）を読む。"""
+
+    def receipt(self, **over):
+        r = {"id": "20261001-0001", "状態": "終了", "作業場": self.ws,
+             "命令": ["qwc", "-p", "直して"], "執行": "sandbox-exec",
+             "判定": "緑", "終了コード": 0, "壁に当たった": None, "理由": [],
+             "差分": {"追加": [], "削除": [], "変更": [{"path": "auth.py", "前": 2, "後": 2}]}}
+        r.update(over)
+        path = os.path.join(self.tmp.name, "受領証.json")
+        with open(path, "w") as f:
+            json.dump(r, f, ensure_ascii=False)
+        return path
+
+    def judge_with(self, rp, claim="修正しました"):
+        code, out = self.cli("judge", self.run_dir, "--claim", claim, "--receipt", rp, "--json")
+        return code, (json.loads(out) if out.strip() else None)
+
+    def test_green_receipt_proves_outside_by_the_wall(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        _, r = self.judge_with(self.receipt())
+        con = {i["id"]: i for i in r["contract"]}
+        self.assertEqual(con["outside"]["verdict"], pc.PROVEN)
+        self.assertIn("壁", con["outside"]["evidence"][0])
+        self.assertEqual(con["guardrun_mark"]["verdict"], pc.PROVEN)
+        self.assertEqual(con["two_diffs"]["verdict"], pc.PROVEN)
+
+    def test_interrupted_run_says_nothing_about_outside(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        _, r = self.judge_with(self.receipt(判定="中断", 状態="中断", 終了コード=None))
+        con = {i["id"]: i for i in r["contract"]}
+        self.assertEqual(con["outside"]["verdict"], pc.UNVERIFIED)
+        self.assertIn("見届けていない", con["outside"]["missing"][0])
+        self.assertEqual(con["guardrun_mark"]["verdict"], pc.UNVERIFIED)
+
+    def test_red_mark_is_disproven(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        _, r = self.judge_with(self.receipt(判定="赤", 理由=["test_login.py が消えた（3行）"]))
+        mark = next(i for i in r["contract"] if i["id"] == "guardrun_mark")
+        self.assertEqual(mark["verdict"], pc.DISPROVEN)
+        self.assertTrue(any("消えた" in e for e in mark["evidence"]))
+
+    def test_two_diffs_disagree(self):
+        """受領証と封印の差分が食い違えば、どちらかが間違っている。"""
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        write(self.ws, "notes.txt", "x\n")
+        _, r = self.judge_with(self.receipt())   # 受領証は auth.py の変更しか知らない
+        two = next(i for i in r["contract"] if i["id"] == "two_diffs")
+        self.assertEqual(two["verdict"], pc.DISPROVEN)
+        self.assertTrue(any("notes.txt" in e for e in two["evidence"]), two["evidence"])
+
+    def test_receipt_for_another_workspace_is_refused(self):
+        self.seal()
+        code, _ = self.judge_with(self.receipt(作業場="/tmp/somewhere-else"))
+        self.assertEqual(code, pc.EXIT_USAGE)
+
+    def test_format_v2_fields_are_kept(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        _, r = self.judge_with(self.receipt(形式版=2, 期待={"判定": "緑", "終了コード": 0},
+                                            事後={"照合": "期待どおり"}))
+        self.assertEqual(r["receipt"]["version"], 2)
+        self.assertEqual(r["receipt"]["expect_check"], "期待どおり")
+
+    def test_receipt_has_no_inner_commands(self):
+        """受領証の「命令」はエージェント全体の1本。テストを実行した証拠にはしない。"""
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        _, r = self.judge_with(self.receipt(), claim="テストを実行しました")
+        self.assertEqual(r["claims"][0]["verdict"], pc.UNVERIFIED)
+
+    def test_receipt_and_harness_together(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        ev = os.path.join(self.tmp.name, "events.jsonl")
+        with open(ev, "w") as f:
+            f.write(json.dumps({"type": "item.completed", "item": {
+                "id": "item_0", "type": "command_execution", "command": f"{PY} test_login.py",
+                "aggregated_output": "", "exit_code": 0, "status": "completed"}}) + "\n")
+        code, out = self.cli("judge", self.run_dir, "--claim", "auth.py を修正し、テストを実行し、通りました。",
+                             "--receipt", self.receipt(), "--codex-jsonl", ev, "--json")
+        r = json.loads(out)
+        bad = [i for i in r["claims"] + r["contract"] if i["verdict"] != pc.PROVEN]
+        self.assertEqual(bad, [], bad)
+        self.assertEqual(code, 0)
+
+
 class TestSealing(Case):
     def test_seal_id_mismatch_refuses(self):
         self.seal()
