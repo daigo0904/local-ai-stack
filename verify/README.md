@@ -167,6 +167,22 @@ OpenShell の記録に、壁の中で走った1本1本の命令とファイル�
 「テストを実行した」はハーネスの記録、「何が変わったか」は封印からの差分が担う。3つそろえば、
 申告も契約も全部 PROVEN になりうる（試験で確かめた）。
 
+### 本物で確かめた（2026-10-01、OpenShell main fde79f1・Linux 6.18・docker driver）
+
+ソースから gateway・supervisor・sandbox を作り（ghcr のイメージは取れなかったので、ubuntu:24.04 の上に
+自前で載せた）、砂場の中で calc.py を書き換え、/etc への書き込み、/tmp への書き込み、外への TCP 接続を試した。
+
+- **Landlock は効いた**（/etc への書き込みは Permission denied）。だが **OCSF の JSONL には何も出なかった。**
+  「Landlock ruleset built」は今の版では JSONL に出ず、テキストのログに「Isolation boundary enforcement
+  confirmed」と出るだけ。→ `openshell_wall` は **UNVERIFIED のまま**（それを Landlock の証拠には読まない）
+- 外への接続の拒否は `Network Activity / Denied` として出た（壁の証拠として件数を添える）
+- 既定の方針の `read_write` は `/tmp` と `/dev/null`。砂場は実際に `/tmp` に書けた → `outside` は UNVERIFIED
+- コマンドの実行（`sandbox exec`）は SSH の接続としてしか出ない。何を走らせたかは記録に無い
+
+実物の記録と方針は `testdata/openshell-fde79f1-*` に置き、試験（`TestRealOpenShellRecord`）で固定した。
+**本物の記録では、壁も作業場の外も PROVEN にならない。**OpenShell 側が Landlock の適用を OCSF に出すまでは、
+OpenShell の上で「作業場の外を変えていない」を言うには、別の証拠（guardrun の受領証など）が要る。
+
 ## 試験
 
 ```sh

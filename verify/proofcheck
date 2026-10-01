@@ -567,7 +567,12 @@ def judge_openshell(o, policy, workspace):
         out.append(item("openshell_wall", "OpenShell の壁（Landlock）が掛かっていた", PROVEN, DETERMINISTIC, ev_wall))
     else:
         out.append(item("openshell_wall", "OpenShell の壁（Landlock）が掛かっていた", UNVERIFIED, DETERMINISTIC, ev_wall,
-                        ["「Landlock ruleset built」の記録（ocsf_json_enabled を true にした砂場の記録）"]))
+                        # 2026-10-01、OpenShell main（fde79f1）を docker で動かして確かめた: 今の版は
+                        # この記録を OCSF の JSONL に出さない（壁はテキストのログに「Isolation boundary
+                        # enforcement confirmed」と出るだけ）。それを Landlock が掛かった証拠には読まない
+                        # ——best_effort では「確かめた」の中身が Landlock かどうか、記録からは分からない
+                        ["「Landlock ruleset built」の記録（ocsf_json_enabled を true にした砂場の記録）。"
+                         "OpenShell main（fde79f1）はこれを JSONL に出さないので、その版では壁は UNVERIFIED のまま"]))
     return out
 
 

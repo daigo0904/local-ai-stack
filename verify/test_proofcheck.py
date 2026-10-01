@@ -555,6 +555,33 @@ class TestOpenShellOcsf(Case):
         self.assertEqual(code, 0)
 
 
+class TestRealOpenShellRecord(Case):
+    """**本物の OpenShell の記録**（2026-10-01、main fde79f1 をソースから作り docker driver で動かした）。
+
+    砂場の中で calc.py を書き換え、/etc への書き込み（Landlock が断った）、/tmp への書き込み（方針が許す）、
+    外への TCP 接続（断られた）を試した。JSONL に出たのは SSH・relay・方針の読み込み・接続の拒否だけで、
+    **Landlock の記録もコマンドの実行も出なかった。**この記録で、壁と作業場の外を PROVEN にしてはいけない。"""
+
+    DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata")
+    judge_os = TestOpenShellOcsf.judge_os
+
+    def test_real_record_keeps_wall_and_outside_unverified(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        _, r = self.judge_os(os.path.join(self.DATA, "openshell-fde79f1-ocsf.jsonl"),
+                             os.path.join(self.DATA, "openshell-fde79f1-policy.yaml"))
+        con = {i["id"]: i for i in r["contract"]}
+        self.assertEqual(con["openshell_wall"]["verdict"], pc.UNVERIFIED)
+        self.assertTrue(any("拒んだ: 1 件" in e for e in con["openshell_wall"]["evidence"]))
+        self.assertEqual(con["outside"]["verdict"], pc.UNVERIFIED)
+
+    def test_real_policy_lets_tmp_be_written(self):
+        """本物の既定の方針は read_write に /tmp を含む。Landlock が確かめられても、外は言えない。"""
+        pol = pc.load_openshell_policy(os.path.join(self.DATA, "openshell-fde79f1-policy.yaml"))
+        self.assertIn("/tmp", pol["read_write"])
+        self.assertTrue(pol["include_workdir"])
+
+
 class TestSealing(Case):
     def test_seal_id_mismatch_refuses(self):
         self.seal()
