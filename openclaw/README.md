@@ -63,4 +63,4 @@ cd ~/.openclaw && git init && git add -A && git commit -m "いまの状態"
 ## 関連
 
 - [openclaw-guards](https://github.com/ahogorirappa/openclaw-guards) — この一式が「落ちずに黙る」のを見つけて直す層
-- [qwythos-code](https://github.com/ahogorirappa/qwythos-code) — ローカルのモデルで動く自律コーディングCLI（`qwc-projects.txt` の相手）
+- [qwythos-code](https://github.com/daigo0904/qwythos-code) — ローカルのモデルで動く自律コーディングCLI（`qwc-projects.txt` の相手）
