@@ -144,6 +144,29 @@ Codex は `codex exec --oss --local-provider ollama --sandbox workspace-write --
 書き込みを断るので、エージェントの手が届かない場所にハーネスの記録を書けない。
 guardrun に「記録の書き出し先」を足す変更が要る。
 
+## NVIDIA OpenShell とつなぐ
+
+壁は guardrun でなくてもよい。OpenShell の砂場で `ocsf_json_enabled` を true にすると、監督プロセスが
+`/var/log/openshell-ocsf.YYYY-MM-DD.log` に OCSF v1.8 の JSONL を書く。それを `--ocsf` で渡す。
+
+```sh
+proofcheck judge RUNDIR --seal-id <封印ID> --codex-jsonl events.jsonl \
+  --ocsf openshell-ocsf.2026-10-01.log --openshell-policy policy.yaml
+```
+
+| OpenShell の記録 | 契約の行 |
+| --- | --- |
+| 「Landlock ruleset built」があり、「Running WITHOUT filesystem restrictions」などが無い | `openshell_wall` を PROVEN（掛からなかった記録や重大な検知があれば DISPROVEN） |
+| 上に加えて、方針の `read_write` が作業場の中だけ | `outside` を PROVEN（壁の保証として） |
+| 外への接続の拒否 | 件数を証拠に添えるだけ（壁が効いた記録であって、嘘ではない） |
+
+**既定の `landlock.compatibility: best_effort` では、Landlock が掛からないと制限なしで走る。**
+だから記録で確かめるまで、作業場の外は言わない。方針に `/tmp` などがあれば、そこは言えない。
+
+OpenShell の記録に、壁の中で走った1本1本の命令とファイルの変化は無い（調べた版：main 021400b）。
+「テストを実行した」はハーネスの記録、「何が変わったか」は封印からの差分が担う。3つそろえば、
+申告も契約も全部 PROVEN になりうる（試験で確かめた）。
+
 ## 試験
 
 ```sh

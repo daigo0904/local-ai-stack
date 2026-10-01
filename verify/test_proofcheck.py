@@ -398,6 +398,113 @@ class TestGuardrunReceipt(Case):
         self.assertEqual(code, 0)
 
 
+class TestOpenShellOcsf(Case):
+    """NVIDIA OpenShell の監査記録（OCSF v1.8 JSONL）を読む。形は docs/observability/ocsf-json-export.mdx と
+    crates/openshell-sandbox/src/sandbox/linux/landlock.rs の文言に合わせた。"""
+
+    META = {"product": {"name": "OpenShell Sandbox Supervisor", "vendor_name": "NVIDIA", "version": "0.3.0"},
+            "version": "1.8.0"}
+
+    def ocsf(self, *events):
+        path = os.path.join(self.tmp.name, "openshell-ocsf.log")
+        with open(path, "w") as f:
+            for e in events:
+                f.write(json.dumps(dict(metadata=self.META, **e)) + "\n")
+        return path
+
+    def landlock_built(self):
+        return {"class_uid": 5019, "class_name": "Device Config State Change", "severity_id": 1,
+                "status_id": 1, "message": "Landlock ruleset built [rules_applied:4 skipped:0]"}
+
+    def policy(self, text):
+        path = os.path.join(self.tmp.name, "policy.yaml")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def judge_os(self, ocsf, policy=None, claim="修正しました"):
+        args = ["judge", self.run_dir, "--claim", claim, "--ocsf", ocsf, "--json"]
+        if policy:
+            args += ["--openshell-policy", policy]
+        code, out = self.cli(*args)
+        return code, (json.loads(out) if out.strip() else None)
+
+    def test_landlock_and_workspace_only_policy_prove_outside(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        pol = self.policy(f"version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_only: [/usr, /lib]\n  read_write: [{self.ws}]\n")
+        _, r = self.judge_os(self.ocsf(self.landlock_built()), pol)
+        con = {i["id"]: i for i in r["contract"]}
+        self.assertEqual(con["openshell_wall"]["verdict"], pc.PROVEN)
+        self.assertEqual(con["outside"]["verdict"], pc.PROVEN)
+        self.assertIn("OpenShell", con["outside"]["evidence"][0])
+
+    def test_policy_allowing_tmp_does_not_prove_outside(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        pol = self.policy("version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_write:\n    - /tmp\n")
+        _, r = self.judge_os(self.ocsf(self.landlock_built()), pol)
+        out = next(i for i in r["contract"] if i["id"] == "outside")
+        self.assertEqual(out["verdict"], pc.UNVERIFIED)
+        self.assertIn("/tmp", out["missing"][0])
+
+    def test_best_effort_without_landlock_is_disproven(self):
+        """既定の best_effort では、Landlock が掛からないと制限なしで走る。"""
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        ng = {"class_uid": 2004, "class_name": "Detection Finding", "severity_id": 4,
+              "message": "Running WITHOUT filesystem restrictions: Landlock is unavailable. "}
+        _, r = self.judge_os(self.ocsf(ng), self.policy("version: 1\n"))
+        con = {i["id"]: i for i in r["contract"]}
+        self.assertEqual(con["openshell_wall"]["verdict"], pc.DISPROVEN)
+        self.assertEqual(con["outside"]["verdict"], pc.UNVERIFIED)
+
+    def test_without_policy_outside_stays_unverified(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        _, r = self.judge_os(self.ocsf(self.landlock_built()))
+        out = next(i for i in r["contract"] if i["id"] == "outside")
+        self.assertEqual(out["verdict"], pc.UNVERIFIED)
+        self.assertIn("--openshell-policy", out["missing"][0])
+
+    def test_denials_are_shown_not_punished(self):
+        """外への接続を拒んだのは、壁が効いた記録。それだけで嘘にはしない。"""
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        denied = {"class_uid": 4001, "class_name": "Network Activity", "action": "Denied",
+                  "severity_id": 3, "message": "CONNECT denied pypi.org:443"}
+        _, r = self.judge_os(self.ocsf(self.landlock_built(), denied))
+        wall = next(i for i in r["contract"] if i["id"] == "openshell_wall")
+        self.assertEqual(wall["verdict"], pc.PROVEN)
+        self.assertTrue(any("拒んだ: 1 件" in e for e in wall["evidence"]), wall["evidence"])
+
+    def test_log_without_openshell_records_is_refused(self):
+        self.seal()
+        path = os.path.join(self.tmp.name, "other.log")
+        with open(path, "w") as f:
+            f.write(json.dumps({"class_uid": 4001, "metadata": {"product": {"name": "Other"}}}) + "\n")
+        code, _ = self.cli("judge", self.run_dir, "--claim", "x", "--ocsf", path)
+        self.assertEqual(code, pc.EXIT_USAGE)
+
+    def test_openshell_with_harness_reaches_all_proven(self):
+        """壁は OpenShell、命令はハーネスの記録、差分は封印。3つそろえば全部 PROVEN になりうる。"""
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        ev = os.path.join(self.tmp.name, "events.jsonl")
+        with open(ev, "w") as f:
+            f.write(json.dumps({"type": "item.completed", "item": {
+                "id": "item_0", "type": "command_execution", "command": f"{PY} test_login.py",
+                "aggregated_output": "", "exit_code": 0, "status": "completed"}}) + "\n")
+        pol = self.policy(f"version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_write: [{self.ws}]\n")
+        code, out = self.cli("judge", self.run_dir, "--claim", "auth.py を修正し、テストを実行し、通りました。",
+                             "--ocsf", self.ocsf(self.landlock_built()), "--openshell-policy", pol,
+                             "--codex-jsonl", ev, "--json")
+        r = json.loads(out)
+        bad = [(i["id"], i["verdict"]) for i in r["claims"] + r["contract"] if i["verdict"] != pc.PROVEN]
+        self.assertEqual(bad, [])
+        self.assertEqual(code, 0)
+
+
 class TestSealing(Case):
     def test_seal_id_mismatch_refuses(self):
         self.seal()
