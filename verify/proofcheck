@@ -457,7 +457,14 @@ def judge_contract(c, d, final_runs, base_runs, receipt):
     out = []
     ch = touched(d)
 
-    for i, cmd in enumerate(c.get("repro", [])):
+    if final_runs is None:
+        # --fast で再実行を打ち切った。テストの行は判定しない（PROVEN にも DISPROVEN にもしない）
+        stopped = "テストの再実行を打ち切った（--fast：先に安い証拠で DISPROVEN が出た）"
+        for key, label in (("repro", "再現テストが修正後に通る"), ("must_pass", "通る"), ("keep_passing", "今も通る")):
+            for i, cmd in enumerate(c.get(key, [])):
+                out.append(item(f"{key}[{i}]", f"{label}: {cmd}", UNVERIFIED, DETERMINISTIC, [], [stopped]))
+
+    for i, cmd in enumerate(c.get("repro", []) if final_runs is not None else []):
         f, b = final_runs[cmd], base_runs[cmd]
         ev = [f"修正前: {desc(b)}", f"修正後: {desc(f)}"]
         if not passed(f):
@@ -471,12 +478,12 @@ def judge_contract(c, d, final_runs, base_runs, receipt):
             out.append(item(f"repro[{i}]", f"再現テストが修正後に通る: {cmd}",
                             PROVEN, DETERMINISTIC, ev))
 
-    for i, cmd in enumerate(c.get("must_pass", [])):
+    for i, cmd in enumerate(c.get("must_pass", []) if final_runs is not None else []):
         f = final_runs[cmd]
         out.append(item(f"must_pass[{i}]", f"通る: {cmd}",
                         PROVEN if passed(f) else DISPROVEN, DETERMINISTIC, [desc(f)]))
 
-    for i, cmd in enumerate(c.get("keep_passing", [])):
+    for i, cmd in enumerate(c.get("keep_passing", []) if final_runs is not None else []):
         f, b = final_runs[cmd], base_runs[cmd]
         ev = [f"修正前: {desc(b)}", f"修正後: {desc(f)}"]
         if not passed(f):
@@ -563,72 +570,163 @@ def judge_two_diffs(rd, d, c):
     return item("two_diffs", "受領証の差分と封印からの差分が一致する", DISPROVEN, DETERMINISTIC, ev)
 
 
-def judge_claims(claims, c, d, final_runs, base_runs, receipt):
+# ── 判定の核（定式化。verify/定式化.md） ─────────────────────────
+#
+# 証拠 e = (種類, 向き, 強さ, 出どころ, 中身)
+#   向き   "+" 裏づける / "-" 矛盾する / "?" 判断に使えない（理由だけ残す）
+#   強さ   改竄されにくさ。カーネル ＞ 検証器 ＞ ハーネス
+# 主張の種類 k ごとに、PROVEN に要る証拠の種類 R(k) と、その最低限の強さ m を決めておく。
+# decide(k, E) は E の並びによらず、同じ入力に同じ答えを返す純粋な関数。
+
+KERNEL, VERIFIER, HARNESS = 3, 2, 1
+STRENGTH_NAME = {KERNEL: "カーネル（guardrun の受領証）", VERIFIER: "検証器（proofcheck が自分で取った事実）",
+                 HARNESS: "ハーネス（エージェント側のプロセスの記録）"}
+
+# 証拠の種類: (最低限の強さ, 足りないときに書くこと)
+EVIDENCE_KINDS = {
+    "fs_change": (VERIFIER, "封印からの作業場の差分"),
+    "test_process": (HARNESS, "エージェントが走らせた命令の記録（guardrun の受領証か、ハーネスの記録）"),
+    "test_result": (VERIFIER, "契約のテスト"),
+    "repro_flip": (VERIFIER, "再現テスト（修正前に落ち、修正後に通るもの）を契約の repro に"),
+}
+
+# 主張の種類: (要る証拠の種類, 意味の判断を含むか)
+# other は要る証拠が定義されていないので、どんな証拠があっても PROVEN にならない。
+CLAIM_REQUIREMENTS = {
+    "changed_files": (("fs_change",), False),
+    "ran_tests": (("test_process",), False),
+    "tests_passed": (("test_result",), False),
+    "bug_fixed": (("repro_flip",), True),
+    "other": ((), True),
+}
+
+
+def ev(kind, stance, strength, source, detail):
+    return {"kind": kind, "stance": stance, "strength": strength, "source": source, "detail": detail}
+
+
+def decide(claim_kind, evidence):
+    """主張1つを三値で決める。
+
+    返り: {"verdict", "basis", "trust", "used", "missing", "conflict"}
+      trust … 判定に使った証拠のうち一番弱いものの強さ（どこから不確かさが入ったか）
+    規則（定式化.md の D1〜D4）:
+      D1 強さが足りる「-」と「+」が同じ主張に両方ある → UNVERIFIED（証拠どうしの食い違い）
+      D2 強さが足りる「-」がある                         → DISPROVEN
+      D3 要る種類が全部、強さが足りる「+」で埋まる       → PROVEN
+      D4 それ以外                                        → UNVERIFIED（足りない種類を書く）"""
+    required, semantic = CLAIM_REQUIREMENTS.get(claim_kind, ((), True))
+    basis = SEMANTIC if semantic else DETERMINISTIC
+    admissible = [e for e in evidence
+                  if e["kind"] in required and e["stance"] in "+-"
+                  and e["strength"] >= EVIDENCE_KINDS[e["kind"]][0]]
+    contra = [e for e in admissible if e["stance"] == "-"]
+    support = [e for e in admissible if e["stance"] == "+"]
+    out = {"basis": basis, "used": [], "missing": [], "conflict": False, "trust": None}
+    if contra and support:
+        out.update(verdict=UNVERIFIED, conflict=True, used=contra + support,
+                   missing=["証拠どうしが食い違っている（どちらかの記録が壊れているか、書き換えられている）"])
+    elif contra:
+        out.update(verdict=DISPROVEN, used=contra)
+    elif required and all(any(e["kind"] == k for e in support) for k in required):
+        out.update(verdict=PROVEN, used=support)
+    else:
+        lacking = [k for k in required if not any(e["kind"] == k for e in support)]
+        # 足りない種類ごとに、取れなかった理由（向き「?」の証拠）を添える。
+        # **並びに依存させない**ので、理由は集合にして並べ直す（性質 P3。乱数の試験で一度破れた）
+        def 説明(k):
+            why = sorted({e["detail"] for e in evidence if e["kind"] == k and e["stance"] == "?"})
+            return EVIDENCE_KINDS[k][1] + (f"（{'／'.join(why)}）" if why else "")
+        out.update(verdict=UNVERIFIED,
+                   missing=[説明(k) for k in lacking] if required
+                   else ["この種類の申告に対応する証拠の定義"])
+    if out["used"]:
+        out["trust"] = min(e["strength"] for e in out["used"])
+    return out
+
+
+def claim_evidence(cl, c, d, final_runs, base_runs, receipt):
+    """主張1つに、いま手元にある証拠を集める。判断はしない（decide に任せる）。
+
+    final_runs / base_runs が None のときは、テストの再実行をしていない（--fast で打ち切った）。"""
     out = []
     ch = touched(d)
     test_cmds = c.get("repro", []) + c.get("must_pass", []) + c.get("keep_passing", [])
-    for n, cl in enumerate(claims, 1):
-        ident, text = f"claim{n}", f"{cl['text']}（「{' / '.join(cl['quotes'])}」）"
-        k = cl["kind"]
-        if k == "changed_files":
-            named = cl["files"]
-            if named:
-                miss = [f for f in named if not any(p == f or p.endswith("/" + f) for p in ch)]
-                v = DISPROVEN if miss else PROVEN
-                ev = [f"名指しされたのに変わっていない: {', '.join(miss)}"] if miss \
-                    else [f"名指しされた {', '.join(named)} は変わっている"]
-            else:
-                v = PROVEN if ch else DISPROVEN
-                ev = [f"作業場で {len(ch)} 件変わった"] if ch else ["作業場は封印時から1バイトも変わっていない"]
-            out.append(item(ident, text, v, DETERMINISTIC, ev))
-        elif k == "ran_tests":
-            procs = receipt.get("processes") if receipt else None
-            if procs is None:
-                out.append(item(ident, text, UNVERIFIED, DETERMINISTIC, [],
-                                ["エージェントが走らせた命令の記録（guardrun の受領証か、ハーネスの記録）"]))
-            else:
-                hit = [p for p in procs if looks_like_test(p, test_cmds)]
-                out.append(item(ident, text, PROVEN if hit else DISPROVEN, DETERMINISTIC,
-                                [f"{receipt['source']}: 命令 {len(procs)} 本のうちテストらしきもの {len(hit)} 本"]))
-        elif k == "tests_passed":
-            if not test_cmds:
-                out.append(item(ident, text, UNVERIFIED, DETERMINISTIC, [], ["契約のテスト"]))
-                continue
+    k = cl["kind"]
+    if k == "changed_files":
+        named = cl["files"]
+        if named:
+            miss = [f for f in named if not any(p == f or p.endswith("/" + f) for p in ch)]
+            out.append(ev("fs_change", "-" if miss else "+", VERIFIER, "封印からの差分",
+                          f"名指しされたのに変わっていない: {', '.join(miss)}" if miss
+                          else f"名指しされた {', '.join(named)} は変わっている"))
+        else:
+            out.append(ev("fs_change", "+" if ch else "-", VERIFIER, "封印からの差分",
+                          f"作業場で {len(ch)} 件変わった" if ch else "作業場は封印時から1バイトも変わっていない"))
+    elif k == "ran_tests":
+        procs = receipt.get("processes") if receipt else None
+        if procs is not None:
+            hit = [p for p in procs if looks_like_test(p, test_cmds)]
+            strength = KERNEL if "受領証" in receipt.get("source", "") and "仮" not in receipt.get("source", "") else HARNESS
+            out.append(ev("test_process", "+" if hit else "-", strength, receipt["source"],
+                          f"{receipt['source']}: 命令 {len(procs)} 本のうちテストらしきもの {len(hit)} 本"))
+    elif k == "tests_passed":
+        if test_cmds and final_runs is not None:
             fails = [cmd for cmd in test_cmds if not passed(final_runs[cmd])]
-            ev = [f"テストとフックを元に戻して proofcheck が走らせた: "
-                  + ("; ".join(f"{cmd} → {desc(final_runs[cmd])}" for cmd in fails)
-                     if fails else f"{len(test_cmds)} 本とも通った")]
-            # エージェント自身の最後のテスト実行がどう終わったか。申告との食い違いがここで見える
-            own = [cm for cm in (receipt or {}).get("commands") or []
-                   if looks_like_test(split_command(cm["command"]), test_cmds)]
-            if own:
-                last = own[-1]
-                ev.append(f"{receipt['source']}: エージェントの最後のテスト実行 `{last['command']}` → "
-                          f"終了コード {last['exit_code']}")
-            out.append(item(ident, text, DISPROVEN if fails else PROVEN, DETERMINISTIC, ev))
-        elif k == "bug_fixed":
-            repro = c.get("repro", [])
-            if not repro:
-                out.append(item(ident, text, UNVERIFIED, SEMANTIC, [],
-                                ["再現テスト（修正前に落ち、修正後に通るもの）を契約の repro に"]))
-                continue
+            out.append(ev("test_result", "-" if fails else "+", VERIFIER, "proofcheck の再実行",
+                          "テストとフックを元に戻して proofcheck が走らせた: "
+                          + ("; ".join(f"{cmd} → {desc(final_runs[cmd])}" for cmd in fails)
+                             if fails else f"{len(test_cmds)} 本とも通った")))
+        elif test_cmds:
+            out.append(ev("test_result", "?", VERIFIER, "proofcheck",
+                          "テストの再実行を打ち切った（--fast：先に安い証拠で DISPROVEN が出た）"))
+        # エージェント自身の最後のテスト実行。強さはハーネスなので判定には効かないが、食い違いを見せる
+        own = [cm for cm in (receipt or {}).get("commands") or []
+               if looks_like_test(split_command(cm["command"]), test_cmds)]
+        if own:
+            last = own[-1]
+            out.append(ev("test_result", "+" if last["exit_code"] == 0 else "-", HARNESS, receipt["source"],
+                          f"{receipt['source']}: エージェントの最後のテスト実行 `{last['command']}` → "
+                          f"終了コード {last['exit_code']}"))
+    elif k == "bug_fixed":
+        repro = c.get("repro", [])
+        if repro and final_runs is not None:
             bad = [cmd for cmd in repro if not passed(final_runs[cmd])]
             weak = [cmd for cmd in repro if passed(base_runs[cmd])]
             if bad:
-                out.append(item(ident, text, DISPROVEN, SEMANTIC,
-                                [f"再現テストが修正後も落ちる: {', '.join(bad)}"]))
+                out.append(ev("repro_flip", "-", VERIFIER, "proofcheck の再実行",
+                              f"再現テストが修正後も落ちる: {', '.join(bad)}"))
             elif weak:
-                out.append(item(ident, text, UNVERIFIED, SEMANTIC,
-                                [f"修正前にも通る再現テスト: {', '.join(weak)}"],
-                                ["修正前に落ちる再現テスト"]))
+                out.append(ev("repro_flip", "?", VERIFIER, "proofcheck の再実行",
+                              f"修正前にも通る再現テスト: {', '.join(weak)}"))
             else:
-                out.append(item(ident, text, PROVEN, SEMANTIC,
-                                [f"再現テスト {len(repro)} 本が修正前に落ち、修正後に通る"
-                                 "（「直った」の意味は再現テストに委ねている）"]))
-        else:
-            out.append(item(ident, text, UNVERIFIED, SEMANTIC, [],
-                            ["この種類の申告に対応する証拠の定義"]))
+                out.append(ev("repro_flip", "+", VERIFIER, "proofcheck の再実行",
+                              f"再現テスト {len(repro)} 本が修正前に落ち、修正後に通る"
+                              "（「直った」の意味は再現テストに委ねている）"))
+        elif repro:
+            out.append(ev("repro_flip", "?", VERIFIER, "proofcheck",
+                          "テストの再実行を打ち切った（--fast：先に安い証拠で DISPROVEN が出た）"))
     return out
+
+
+def judge_claims(claims, c, d, final_runs, base_runs, receipt):
+    out = []
+    for n, cl in enumerate(claims, 1):
+        evidence = claim_evidence(cl, c, d, final_runs, base_runs, receipt)
+        r = decide(cl["kind"], evidence)
+        shown = [e["detail"] if e in r["used"] or e["stance"] == "?" else f"（参考・判定に使わない強さ）{e['detail']}"
+                 for e in evidence if e["stance"] != "?" or r["verdict"] != UNVERIFIED]
+        it = item(f"claim{n}", f"{cl['text']}（「{' / '.join(cl['quotes'])}」）",
+                  r["verdict"], r["basis"], shown, r["missing"])
+        it["trust"] = STRENGTH_NAME.get(r["trust"])
+        if r["conflict"]:
+            it["conflict"] = True
+        out.append(it)
+    return out
+
+
+# 再実行が要る主張の種類（--fast で後回しにするもの）
+NEEDS_RUNS = {"tests_passed", "bug_fixed"}
 
 
 def looks_like_test(argv, test_cmds):
@@ -738,17 +836,31 @@ def cmd_judge(a):
 
     base = os.path.join(run, "baseline")
     cmds = list(dict.fromkeys(c.get("repro", []) + c.get("must_pass", []) + c.get("keep_passing", [])))
-    base_runs, final_runs = {}, {}
-    with tempfile.TemporaryDirectory(prefix="proofcheck-") as tmp:
-        b_ws = os.path.join(tmp, "before")
-        f_ws = os.path.join(tmp, "after")
-        copy_tree(base, b_ws)
-        reverted = restored_copy(ws, base, before, after, c, f_ws)
-        for cmd in cmds:
-            base_runs[cmd] = run_cmd(cmd, b_ws, c["timeout_sec"])
-            final_runs[cmd] = run_cmd(cmd, f_ws, c["timeout_sec"])
-
     claims = decompose(claim_text)
+
+    # **安い証拠から先に取る（--fast）。**差分・ハーネスの記録・受領証だけで判定し、
+    #   そこで DISPROVEN が1つでも出れば、テストの再実行（高い証拠）を取らずに打ち切る。
+    #   打ち切っても全体の判定は変わらない（定式化.md の定理 F）。安い段の行は再実行に
+    #   依存しないので、そこで出た DISPROVEN は再実行後も DISPROVEN のまま残り、
+    #   全体は「1つでも DISPROVEN なら DISPROVEN」だから。
+    stopped_early = False
+    if a.fast and cmds:
+        cheap = judge_claims(claims, c, d, None, None, receipt) + judge_contract(c, d, None, None, receipt)
+        stopped_early = any(i["verdict"] == DISPROVEN for i in cheap)
+
+    base_runs, final_runs, reverted = {}, {}, []
+    if stopped_early:
+        base_runs = final_runs = None
+    else:
+        with tempfile.TemporaryDirectory(prefix="proofcheck-") as tmp:
+            b_ws = os.path.join(tmp, "before")
+            f_ws = os.path.join(tmp, "after")
+            copy_tree(base, b_ws)
+            reverted = restored_copy(ws, base, before, after, c, f_ws)
+            for cmd in cmds:
+                base_runs[cmd] = run_cmd(cmd, b_ws, c["timeout_sec"])
+                final_runs[cmd] = run_cmd(cmd, f_ws, c["timeout_sec"])
+
     claim_items = judge_claims(claims, c, d, final_runs, base_runs, receipt)
     contract_items = judge_contract(c, d, final_runs, base_runs, receipt)
     report = {
@@ -763,6 +875,8 @@ def cmd_judge(a):
         "diff": d,
         "reverted_before_testing": reverted,
         "runs": {"before": base_runs, "after": final_runs},
+        "cost": {"runs_done": 0 if stopped_early else 2 * len(cmds), "runs_full": 2 * len(cmds),
+                 "stopped_early": stopped_early},
         "receipt": receipt,
     }
     with open(os.path.join(run, "report.json"), "w") as f:
@@ -783,12 +897,16 @@ def print_report(r):
     print(f"作業場の変化: 追加 {len(d['added'])}・削除 {len(d['removed'])}・変更 {len(d['changed'])}")
     if r["reverted_before_testing"]:
         print(f"テスト前に元へ戻したもの: {', '.join(r['reverted_before_testing'])}")
+    cost = r.get("cost") or {}
+    if cost.get("stopped_early"):
+        print(f"テストの再実行: 打ち切った（{cost['runs_full']} 回ぶんを省いた。安い証拠で DISPROVEN が出たため）")
     for title, items in (("申告", r["claims"]), ("契約", r["contract"])):
         print(f"\n{title}")
         if not items:
             print("  （申告から claim を取り出せなかった）")
         for i in items:
-            print(f"  {MARK[i['verdict']]}  {i['text']}  [{i['basis']}]")
+            print(f"  {MARK[i['verdict']]}  {i['text']}  [{i['basis']}]"
+                  + (f"  決め手: {i['trust']}" if i.get("trust") else ""))
             for e in i["evidence"]:
                 print(f"      証拠: {e}")
             for m in i["missing"]:
@@ -811,6 +929,8 @@ def main(argv=None):
     j.add_argument("--codex-jsonl", help="codex exec --json（または qwc --events）の記録。--claim が無ければ最後の発言を申告に使う")
     j.add_argument("--seal-id", help="seal が出した封印ID。違えば判定しない")
     j.add_argument("--json", action="store_true")
+    j.add_argument("--fast", action="store_true",
+                   help="安い証拠で DISPROVEN が出たら、テストの再実行を取らずに打ち切る（全体の判定は変わらない）")
     a = p.parse_args(argv)
     return cmd_seal(a) if a.cmd == "seal" else cmd_judge(a)
 

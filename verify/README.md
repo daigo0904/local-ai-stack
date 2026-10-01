@@ -53,6 +53,10 @@ proofcheck judge ~/.proofcheck/run-001 --seal-id <封印ID> \
 
 ## 判定のしかた
 
+判定の核の定義・規則・性質は [定式化.md](定式化.md) に書いた。性質は `verify/test_theory.py` で確かめている。
+`--fast` を付けると、差分・記録・受領証という安い証拠で DISPROVEN が出た時点で、テストの再実行を
+取らずに終える（全体の判定は変わらない。定式化.md の定理 F）。
+
 - **申告を atomic claim に分ける。** 「変更した」「テストを走らせた」「通った」「直った」
   「その他の完了」の5種類。規則による分解で、意味は読まない。
 - **テストは proofcheck が自分で走らせる。** 作業場の写しの上で、`must_not_change` に
@@ -145,6 +149,7 @@ guardrun に「記録の書き出し先」を足す変更が要る。
 ```sh
 python3 verify/test_proofcheck.py
 python3 verify/test_agent_run.py
+python3 verify/test_theory.py      # 判定の核の性質（P1〜P8）と定理 F
 ```
 
 実際に見つかった食い違いを小さな作業場で再現している:
