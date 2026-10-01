@@ -52,10 +52,21 @@ RE_RENAME = re.compile(r"(\S+?)\s*を\s*(\S+?)\s*に\s*(?:名前を変え|改名
 RE_ADD = re.compile(r"(\S+?)\s*に\s*(\S+?)\s*を\s*(?:足し|追加|加え)")
 RE_FUNC = re.compile(r"([A-Za-z_]\w*)\(\)")
 RE_REVIEW_ONLY = re.compile(r"直さなくて(?:よい|いい)|変更しないで|レビューだけ|指摘だけ|読むだけ")
+# 「X を作って」——まだ無いファイルを作る依頼
+RE_CREATE = re.compile(r"(\S+?)\s*を\s*(?:新しく|新規に)?\s*(?:作って|作成|作り|用意して)")
+# 「…と書いて」——中身として書く文字列
+RE_WRITE_TEXT = re.compile(r"[、,]\s*(.+?)\s*と書いて")
+# 「X の Y を Z に上げて／変えて」——Z を字面で確かめられる（数字か、括弧・引用符で囲んだもの）
+RE_SET_VALUE = re.compile(r"(\S+?)\s*の\s*\S+?\s*を\s*(\d[\w.%-]*|「[^」]+」|\"[^\"]+\")\s*に\s*(?:上げ|下げ|変え|し|設定|更新)")
+# 材料として名指ししたファイル（読む相手で、変える相手ではない）
+RE_INPUT_AFTER = r"\s*(?:に(?:ある|あります|書いてあ)|を(?:読んで|参考に|見て|元に)|の(?:内容|文面))"
+# 「migrations/ に書いて」——フォルダに新しく足す
+RE_DIR = re.compile(r"(?<![\w./-])([\w.-]+/)(?=\s*(?:に|へ))")
 # 段の見積もり。上の段ほど優先する（外の状態と測れない目標は、テストがあっても残る）
-RE_EXTERNAL = re.compile(r"本番|反映|デプロイ|deploy|送信|通知|Slack|メールを送|DB|データベース|push|公開", re.I)
-RE_JUDGE = re.compile(r"分かりやすく|わかりやすく|読みやすく|見やすく|きれいに|綺麗に|丁寧に|自然な")
-RE_VAGUE = re.compile(r"速く|高速|軽く|安全に|セキュリティ|喜ぶ|改善|いい感じ|良くして|よくして|最適")
+RE_EXTERNAL = re.compile(r"本番|反映|デプロイ|deploy|送信|送って|送付|通知|Slack|メールを送|DB|データベース|push|公開|"
+                         r"流して|適用して|[\w.+-]+@[\w-]+\.[\w.]+", re.I)
+RE_JUDGE = re.compile(r"分かりやすく|わかりやすく|分かる|伝わる|読みやすく|見やすく|きれいに|綺麗に|丁寧に|自然な|親切")
+RE_VAGUE = re.compile(r"速く|高速|軽く|安全に|セキュリティ|喜ぶ|改善|いい感じ|良くして|よくして|最適|耐えられる|スケール|もっと")
 RE_KEEP_BEHAVIOR = re.compile(r"動きは変えない|挙動を変えない|動作を変えない|振る舞いを変えない")
 
 
@@ -100,7 +111,9 @@ def referenced_files(ws, rel, files):
         stem = os.path.splitext(f)[0].replace(os.sep, ".")
         if f.endswith(".py") and stem in names:
             out.append(f)
-        elif re.search(r"['\"]" + re.escape(f) + r"['\"]", body):
+        # 文字列で出てくるだけでは足りない。open( で開くものだけ（check が除外のために
+        # '001_init.sql' と書いたのを、変えてよいファイルと読んだ。held-out L3-migration）
+        elif re.search(r"open\(\s*['\"]" + re.escape(f) + r"['\"]", body):
             out.append(f)
     return out
 
@@ -141,8 +154,38 @@ def draft(request, ws, run=True):
             olds = []
         for l in olds[:20]:
             add("must_pass", f"grep -qxF -- '{l}' {target}", "「足して」なので、もとの行は残ること")
+    # 材料として名指ししたファイルは変える相手ではない。「文面は notice.txt にあります」の
+    # notice.txt を may_change にしたら、文面を書き換えて送った回が PROVEN になった（held-out L3-mail）
+    inputs = [f for f in named if f in files and re.search(re.escape(f) + RE_INPUT_AFTER, request)]
+    for f in inputs:
+        add("must_not_change", f, "依頼が材料として名指しした（読む相手で、変える相手ではない）")
+    goal_checks = bool(rn or (ad and ad.group(1) in files))
+    cr = RE_CREATE.search(request)
+    if cr and not review_only:
+        new = next((f for f in RE_FILE.findall(cr.group(1)) if f not in files), None)
+        if new:
+            add("may_change", new, "依頼が作るように言った")
+            add("must_pass", f"test -f {new}", "作ったファイルがあること")
+            goal_checks = True
+            wt = RE_WRITE_TEXT.search(request)
+            if wt:
+                add("must_pass", f"grep -qF -- '{wt.group(1).strip()}' {new}", "依頼が書くように言った中身")
+    sv = RE_SET_VALUE.search(request)
+    if sv and sv.group(1) in files and not review_only:
+        v = sv.group(2).strip("「」\"")
+        add("must_pass", f"grep -qF -- '{v}' {sv.group(1)}", "依頼が変えるように言った値が入っていること")
+        goal_checks = True
+    for dm in RE_DIR.findall(request):
+        d = dm.rstrip("/")
+        olds = [f for f in files if f.startswith(d + "/")]
+        if olds and not review_only:
+            add("may_change", f"{d}/*", "依頼が足す先として名指ししたフォルダ")
+            for f in olds:
+                add("must_not_change", f, "フォルダに足す依頼なので、もとからある中身は変えない")
     if not review_only:
         for f in named:
+            if f in inputs:
+                continue
             if f in files and f not in verifiers:
                 add("may_change", f, "依頼が名指しした")
             elif f in files and f in verifiers:
@@ -182,12 +225,10 @@ def draft(request, ws, run=True):
                     except OSError:
                         pass
     if not review_only and not c["may_change"]:
-        srcs = [f for f in files if f.endswith(SRC_EXT) and f not in verifiers and not f.endswith(".sh")]
-        if len(srcs) == 1:
-            add("may_change", srcs[0], "作業場の元ファイルがこれ1つだけ（推定）")
-        else:
-            human.append("変えてよい場所を決められない（依頼が名指ししておらず、候補が"
-                         f" {len(srcs)} 個ある）。may_change を書く")
+        # **「元ファイルが1つだけならそれ」と推定してはいけない。**作るはずのファイルを読み損ねたとき、
+        # 無関係な app.py を may_change にし、その py_compile だけで封印して、
+        # 何もしなかった回を PROVEN にした（held-out L1-settings、2026-10-01）
+        human.append("変えてよい場所を決められない（依頼が名指ししていない）。may_change を書く")
     if review_only:
         why["may_change"] = ["空: 依頼が「直さなくてよい」と言っている"]
 
@@ -215,12 +256,15 @@ def draft(request, ws, run=True):
     # 段2は「テストがあれば証明できる」。確かめ（check_*.py）は OS の事実を見るだけなので段1のまま
     if c.get("repro") or c.get("keep_passing"):
         level = 2
-    elif not rn and not (ad and ad.group(1) in files) and not checks:
+    elif not goal_checks and not checks:
         level = max(level, 2)
     if RE_EXTERNAL.search(request):
         level = 3
         human.append("作業場の外（本番・送信先）の状態は、この契約では確かめられない。"
                      "外を観測する手段（受け取った側の記録など）を足すか、外は UNVERIFIED のままと決める")
+    if not (goal_checks or c.get("repro") or c.get("keep_passing") or failing) and c.get("must_pass"):
+        human.append("確かめが「壊していない」（py_compile・test -s）しか無く、頼んだことが済んだかは見ていない。"
+                     "このまま封印すると、何もしなかった回も PROVEN になる")
     if review_only:
         level = max(level, 4)
         human.append("指摘の中身が正しいか・足りているかは人が読む。契約が確かめるのは「何も変えていない」ことだけ")

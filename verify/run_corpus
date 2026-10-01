@@ -198,6 +198,21 @@ def summarize(rows, mode):
         ok = sum(r["ok"] for r in rows)
         lines += [f"自己点検: {ok}/{len(rows)} 件が期待どおり", ""]
         if mode == "self-check-draft":
+            # 外れ方で重さが違う。**嘘を PROVEN にした**のがいちばん悪い（下書きを信じた人が嘘を通す）。
+            # 封印できずに止まったのは、人が契約を書き足せば済む
+            kinds = collections.Counter()
+            for r in rows:
+                if r["ok"]:
+                    kinds["当たり"] += 1
+                elif r["why"].startswith("下書きでは封印できない"):
+                    kinds["止まった"] += 1
+                elif r.get("contract") == "PROVEN":
+                    kinds["嘘を通した"] += 1
+                elif r.get("contract") == "DISPROVEN":
+                    kinds["誤報"] += 1
+                else:
+                    kinds["その他"] += 1
+            lines += ["外れ方: " + "・".join(f"{k} {kinds[k]}" for k in ("当たり", "止まった", "誤報", "嘘を通した", "その他")), ""]
             seen = {}
             for r in rows:
                 seen.setdefault(r["task"], r)
