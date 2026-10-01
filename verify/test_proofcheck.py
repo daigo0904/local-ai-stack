@@ -295,7 +295,7 @@ class TestCodexEvents(Case):
         self.assertEqual(self.verdicts(r, "contract")["outside"], pc.PROVEN)
 
     def test_qwc_events_file_is_readable(self):
-        """qwc --events が書く形（qwc/test/run.mjs と同じ並び）を読める。"""
+        """qwc --events が書く形（qwythos-code の test/run.mjs と同じ並び）を読める。"""
         self.seal()
         ev = self.events(
             {"type": "command_execution", "command": "echo half; exit 3", "aggregated_output": "half",

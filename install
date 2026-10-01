@@ -7,7 +7,8 @@ install — この一式を Mac に入れる。
     ./install guards     一部だけ入れる（guards / openclaw / tools / qwc / verify）
 
 入るもの:
-  qwc       ~/コーディングCLI に置いて ~/bin/qwc から呼べるようにする
+  qwc       本体（daigo0904/qwythos-code）を ~/コーディングCLI に git clone し、
+            ~/bin/qwc から呼べるようにする。もうあれば触らない
   guards    見張り3つ＋claw を ~/bin に置き、launchd に登録する
   openclaw  設定のひな形を ~/.openclaw に置く（鍵は自分で埋める）
   tools     日々の道具22本を ~/bin に置く
@@ -70,15 +71,37 @@ def install_verify():
         print(f"  置いた  {dst}")
 
 
+# qwc の本体。この一式には写しを持たない。
+# 写しを持っていた頃は、本体が24コミット先へ進んでも写しは古いまま残り、
+# 写しにだけ足した機能（--events）が本体に無い、というずれが実際に起きた。
+QWC_REPO = os.environ.get("QWC_REPO", "https://github.com/daigo0904/qwythos-code")
+
+
 def install_qwc():
     print("\n── qwc ──")
     dst = os.path.join(HOME, "コーディングCLI")
-    src = os.path.join(HERE, "qwc")
     if os.path.exists(dst):
-        print(f"  すでにある（触らない）  {dst}")
+        # 作業中の変更があるかもしれないので、入れ直しでも触らない
+        if os.path.isdir(os.path.join(dst, ".git")):
+            print(f"  すでにある（触らない）  {dst}")
+            print(f"    新しくするなら: git -C {dst} pull --ff-only")
+        else:
+            print(f"  すでにあるが、git で取ってきたものではない  {dst}")
+            print("    前の一式が置いた写しかもしれない。本体に替えるなら、退避してから入れ直す:")
+            print(f"      mv {dst} {dst}.old && ./install qwc")
     else:
-        shutil.copytree(src, dst)
-        print(f"  置いた  {dst}")
+        # 取ってこられないときに git がパスワードを聞いて止まらないようにする
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        r = subprocess.run(["git", "clone", QWC_REPO, dst], capture_output=True, text=True,
+                           env=env, stdin=subprocess.DEVNULL)
+        if r.returncode != 0:
+            print(f"  取ってこられなかった  {QWC_REPO}")
+            print("    " + (r.stderr.strip().splitlines() or ["(理由が出ていない)"])[-1])
+            return
+        print(f"  取ってきた  {QWC_REPO} → {dst}")
+    if not os.path.exists(os.path.join(dst, "bin", "qwc.mjs")):
+        print(f"  {dst}/bin/qwc.mjs が無いので、つながない")
+        return
     os.makedirs(BIN, exist_ok=True)
     link = os.path.join(BIN, "qwc")
     target = os.path.join(dst, "bin", "qwc.mjs")
