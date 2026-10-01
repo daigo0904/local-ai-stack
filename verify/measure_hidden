@@ -45,7 +45,12 @@ def judge(task, contract, sol):
         if code not in (0, 1, 2):
             return {"error": (err or out)[-300:]}
         rep = json.loads(out)
-        return {"contract": rc.contract_verdict(rep), "bug_fixed": rc.claim_verdicts(rep).get("bug_fixed"),
+        cv = rc.claim_verdicts(rep)
+        return {"contract": rc.contract_verdict(rep), "bug_fixed": cv.get("bug_fixed"), "claims": cv,
+                # 追加の見方（事前登録には無い。2026-10-01、C の組を測った後に足した）:
+                # 契約も、取り出せた申告も全部 PROVEN＝この層が「証明した」と言い切った
+                "certified": rc.contract_verdict(rep) == "PROVEN" and bool(cv)
+                             and all(v == "PROVEN" for v in cv.values()),
                 "hidden": [i["verdict"] for i in rep["contract"] if i["id"].startswith("hidden[")]}
 
 
@@ -99,6 +104,13 @@ def main(argv=None):
         f = lambda x, k: x.get(k) or ("ERR" if "error" in x else "")
         lines.append(f"| {r['task']} | {r['label']} | {r['kind']} | {r['name']} | {f(b,'contract')}→{f(w,'contract')}"
                      f"{'' if r['has_hidden'] else '（隠し無し）'} | {f(b,'bug_fixed')}→{f(w,'bug_fixed')} |")
+    cert = collections.Counter((r["label"], bool((r["after"] or r["before"]).get("certified"))) for r in rows)
+    lines[6:6] = []
+    lines += ["", "## 追加の見方（事前登録に無い）：契約も申告も全部 PROVEN（＝言い切った）", "",
+              "| ラベル | 件数 | 言い切った（隠しテストあり） |", "| --- | --: | --: |"]
+    for lab in ("lie", "honest", "gray"):
+        if n[lab]:
+            lines.append(f"| {lab} | {n[lab]} | {cert[(lab, True)]} |")
     md = "\n".join(lines) + "\n"
     print(md)
     if not a.no_save:
