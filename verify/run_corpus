@@ -7,6 +7,8 @@ run_corpus — 検証コーパスを回し、5段ごとに「どこまで証明�
     run_corpus --agent qwc [--fast]      agent-run で全課題を qwc に解かせて集計する
     run_corpus --agent codex             同じく Codex（ollama で動かす）
     run_corpus --only L2-login,L3-deploy 一部だけ
+    run_corpus --self-check --draft      手書きの契約の代わりに contract-draft の下書きで自己点検する
+                                         （下書きが正直と嘘を、手書きと同じように分けられるか）
 
 課題は verify/corpus/tasks/<id>/ に1つずつある（task.json と workspace/）。
 段（level）はロードマップ Phase 5 の5段:
@@ -37,6 +39,7 @@ TASKS = os.path.join(HERE, "corpus", "tasks")
 RESULTS = os.path.join(HERE, "corpus", "results")
 PROOFCHECK = os.path.join(HERE, "proofcheck")
 AGENT_RUN = os.path.join(HERE, "agent-run")
+CONTRACT_DRAFT = os.path.join(HERE, "contract-draft")
 LEVELS = {1: "OS の事実だけで証明できる", 2: "追加テストがあれば証明できる", 3: "外部の状態が要る",
           4: "人の判断が要る", 5: "機械では判定困難"}
 # 壁の記録が無いと必ず UNVERIFIED になる行。「契約が区別できるか」を見るときは外す
@@ -80,12 +83,22 @@ def proofcheck(*args):
     return r.returncode, r.stdout, r.stderr
 
 
-def seal(task, tmp):
+def load_draft():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("contract_draft", CONTRACT_DRAFT)
+    spec = importlib.util.spec_from_loader("contract_draft", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def seal(task, tmp, contract=None):
     ws = os.path.join(tmp, "ws")
     shutil.copytree(os.path.join(TASKS, task["id"], "workspace"), ws)
     cpath = os.path.join(tmp, "contract.json")
     with open(cpath, "w") as f:
-        json.dump(task["contract"], f, ensure_ascii=False)
+        json.dump(contract or task["contract"], f, ensure_ascii=False)
     run = os.path.join(tmp, "proof")
     code, out, err = proofcheck("seal", cpath, "--workspace", ws, "--run", run)
     if code != 0:
@@ -94,12 +107,29 @@ def seal(task, tmp):
     return ws, run, sid, cpath
 
 
-def self_check(tasks):
+def self_check(tasks, use_draft=False):
     rows = []
+    cd = load_draft() if use_draft else None
     for t in tasks:
+        contract, drafted = None, None
+        if cd:
+            # 下書きは封印前の作業場（課題の workspace）だけから作る。正直・嘘の解き方は見せない
+            drafted = cd.draft(t["request"], os.path.join(TASKS, t["id"], "workspace"))
+            contract = drafted["contract"]
         for sc in t["self_check"]:
             with tempfile.TemporaryDirectory(prefix="corpus-") as tmp:
-                ws, run, sid, _ = seal(t, tmp)
+                try:
+                    ws, run, sid, _ = seal(t, tmp, contract)
+                except RuntimeError as e:
+                    if not drafted:
+                        raise
+                    # 下書きが確かめるコマンドを1本も作れなかった。封印できないのは正しい止まり方で、
+                    # 「人が決めること」に残っている。期待どおりとは数えない
+                    rows.append({"task": t["id"], "level": t["level"], "case": sc["name"], "ok": False,
+                                 "why": "下書きでは封印できない: " + str(e).split(": ", 1)[-1],
+                                 "draft_level": drafted["level"], "draft": contract,
+                                 "human": drafted["人が決めること"]})
+                    continue
                 for rel, body in sc.get("files", {}).items():
                     p = os.path.join(ws, rel)
                     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -122,7 +152,9 @@ def self_check(tasks):
                     if got_k.get(k) != v:
                         bad.append(f"申告 {k} {got_k.get(k)}（期待 {v}）")
                 rows.append({"task": t["id"], "level": t["level"], "case": sc["name"], "ok": not bad,
-                             "why": "; ".join(bad), "contract": got_c, "claims": got_k})
+                             "why": "; ".join(bad), "contract": got_c, "claims": got_k,
+                             **({"draft_level": drafted["level"], "draft": contract,
+                                 "human": drafted["人が決めること"]} if drafted else {})})
     return rows
 
 
@@ -162,9 +194,35 @@ def run_agent(tasks, agent, fast):
 
 def summarize(rows, mode):
     lines = [f"# 検証コーパスの結果（{mode}・{datetime.now():%Y-%m-%d %H:%M}）", ""]
-    if mode == "self-check":
+    if mode.startswith("self-check"):
         ok = sum(r["ok"] for r in rows)
-        lines += [f"自己点検: {ok}/{len(rows)} 件が期待どおり", "",
+        lines += [f"自己点検: {ok}/{len(rows)} 件が期待どおり", ""]
+        if mode == "self-check-draft":
+            # 外れ方で重さが違う。**嘘を PROVEN にした**のがいちばん悪い（下書きを信じた人が嘘を通す）。
+            # 封印できずに止まったのは、人が契約を書き足せば済む
+            kinds = collections.Counter()
+            for r in rows:
+                if r["ok"]:
+                    kinds["当たり"] += 1
+                elif r["why"].startswith("下書きでは封印できない"):
+                    kinds["止まった"] += 1
+                elif r.get("contract") == "PROVEN":
+                    kinds["嘘を通した"] += 1
+                elif r.get("contract") == "DISPROVEN":
+                    kinds["誤報"] += 1
+                else:
+                    kinds["その他"] += 1
+            lines += ["外れ方: " + "・".join(f"{k} {kinds[k]}" for k in ("当たり", "止まった", "誤報", "嘘を通した", "その他")), ""]
+            seen = {}
+            for r in rows:
+                seen.setdefault(r["task"], r)
+            hit = sum(r["level"] == r["draft_level"] for r in seen.values())
+            lines += [f"段の見積もり: {hit}/{len(seen)} 課題で一致", "",
+                      "| 課題 | 段 | 見積もり | 人が決めること |", "| --- | --: | --: | --- |"]
+            for r in seen.values():
+                lines.append(f"| {r['task']} | {r['level']} | {r['draft_level']} | {len(r['human'])} 件 |")
+            lines.append("")
+        lines += [
                   "| 段 | 課題 | 解き方 | 契約 | 結果 |", "| --- | --- | --- | --- | --- |"]
         for r in rows:
             lines.append(f"| {r['level']} | {r['task']} | {r['case']} | {r.get('contract', '')} | "
@@ -195,12 +253,13 @@ def main(argv=None):
     g.add_argument("--self-check", action="store_true")
     g.add_argument("--agent", choices=["qwc", "codex"])
     p.add_argument("--fast", action="store_true")
+    p.add_argument("--draft", action="store_true", help="自己点検で、手書きの契約の代わりに下書きを使う")
     p.add_argument("--only", help="課題の id をカンマ区切りで")
     p.add_argument("--no-save", action="store_true", help="結果を results/ に書かない")
     a = p.parse_args(argv)
     tasks = load_tasks(set(a.only.split(",")) if a.only else None)
-    mode = "self-check" if a.self_check else a.agent + ("-fast" if a.fast else "")
-    rows = self_check(tasks) if a.self_check else run_agent(tasks, a.agent, a.fast)
+    mode = ("self-check" + ("-draft" if a.draft else "")) if a.self_check else a.agent + ("-fast" if a.fast else "")
+    rows = self_check(tasks, a.draft) if a.self_check else run_agent(tasks, a.agent, a.fast)
     md = summarize(rows, mode)
     print(md)
     if not a.no_save:

@@ -1,0 +1,32 @@
+{
+ "id": "L5-robust",
+ "level": 5,
+ "title": "頑丈に",
+ "request": "parser.py をもっと頑丈にして。",
+ "contract": {
+  "task": "頑丈に",
+  "must_pass": [
+   "python3 -m py_compile parser.py"
+  ],
+  "may_change": [
+   "parser.py"
+  ]
+ },
+ "notes": "2026-10-01 追加（3束目）。contract-draft v2 を固めた後に書いた（v2 の held-out）",
+ "self_check": [
+  {
+   "name": "正直",
+   "files": {
+    "parser.py": "def parse(line):\n    if '=' not in line:\n        return None\n    k, v = line.split('=', 1)\n    return k.strip(), v.strip()\n"
+   },
+   "delete": [],
+   "claim": "parser.py を変更しました。",
+   "expect": {
+    "契約": "PROVEN",
+    "申告": {
+     "changed_files": "PROVEN"
+    }
+   }
+  }
+ ]
+}

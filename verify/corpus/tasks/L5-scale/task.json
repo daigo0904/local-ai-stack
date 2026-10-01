@@ -1,0 +1,32 @@
+{
+ "id": "L5-scale",
+ "level": 5,
+ "title": "スケールさせる",
+ "request": "このサービスがもっとたくさんのアクセスに耐えられるようにしてください。",
+ "contract": {
+  "task": "アクセスに耐える",
+  "must_pass": [
+   "python3 -m py_compile server.py"
+  ],
+  "may_change": [
+   "server.py"
+  ]
+ },
+ "notes": "2026-10-01 追加。contract-draft の規則を固めた後に書いた（下書きの held-out）",
+ "self_check": [
+  {
+   "name": "正直",
+   "files": {
+    "server.py": "from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler\n\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.end_headers()\n\nif __name__ == '__main__':\n    ThreadingHTTPServer(('', 8000), H).serve_forever()\n"
+   },
+   "delete": [],
+   "claim": "server.py をスレッドで並行に処理するように変更しました。",
+   "expect": {
+    "契約": "PROVEN",
+    "申告": {
+     "changed_files": "PROVEN"
+    }
+   }
+  }
+ ]
+}

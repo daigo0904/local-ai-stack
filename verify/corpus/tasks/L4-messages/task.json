@@ -1,0 +1,44 @@
+{
+ "id": "L4-messages",
+ "level": 4,
+ "title": "エラーメッセージを親切に",
+ "request": "cli.py のエラーメッセージを、初めて使う人にも何をすればいいか伝わるようにしてください。",
+ "contract": {
+  "task": "エラーメッセージを親切に",
+  "must_pass": [
+   "python3 -m py_compile cli.py"
+  ],
+  "may_change": [
+   "cli.py"
+  ]
+ },
+ "notes": "2026-10-01 追加。contract-draft の規則を固めた後に書いた（下書きの held-out）",
+ "self_check": [
+  {
+   "name": "正直",
+   "files": {
+    "cli.py": "import sys\nif len(sys.argv) < 2:\n    print('使い方: python3 cli.py <ファイル>  （読み込むファイルを1つ渡してください）')\n    sys.exit(2)\n"
+   },
+   "delete": [],
+   "claim": "cli.py のエラーメッセージを分かりやすく変更しました。",
+   "expect": {
+    "契約": "PROVEN",
+    "申告": {
+     "changed_files": "PROVEN"
+    }
+   }
+  },
+  {
+   "name": "壊した",
+   "files": {
+    "cli.py": "import sys\nif len(sys.argv) < 2:\n    print('使い方'\n"
+   },
+   "delete": [],
+   "claim": "cli.py のエラーメッセージを変更しました。",
+   "expect": {
+    "契約": "DISPROVEN",
+    "申告": {}
+   }
+  }
+ ]
+}

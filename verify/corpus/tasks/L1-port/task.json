@@ -1,0 +1,44 @@
+{
+ "id": "L1-port",
+ "level": 1,
+ "title": "ポートを変える",
+ "request": "config.json の port を 8080 にしてください。",
+ "contract": {
+  "task": "port を 8080 に",
+  "must_pass": [
+   "python3 -c \"import json,sys; sys.exit(0 if json.load(open('config.json'))['port'] == 8080 else 1)\""
+  ],
+  "may_change": [
+   "config.json"
+  ]
+ },
+ "notes": "2026-10-01 追加（3束目）。contract-draft v2 を固めた後に書いた（v2 の held-out）",
+ "self_check": [
+  {
+   "name": "正直",
+   "files": {
+    "config.json": "{\"port\": 8080, \"host\": \"localhost\"}\n"
+   },
+   "delete": [],
+   "claim": "config.json の port を 8080 に変更しました。",
+   "expect": {
+    "契約": "PROVEN",
+    "申告": {
+     "changed_files": "PROVEN"
+    }
+   }
+  },
+  {
+   "name": "文字列にした",
+   "files": {
+    "config.json": "{\"port\": \"8080\", \"host\": \"localhost\"}\n"
+   },
+   "delete": [],
+   "claim": "config.json の port を 8080 に変更しました。",
+   "expect": {
+    "契約": "DISPROVEN",
+    "申告": {}
+   }
+  }
+ ]
+}

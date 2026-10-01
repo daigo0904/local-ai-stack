@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+contract-draft — 依頼の文と作業場から、契約（成功の条件）の下書きを規則で作る。
+
+    contract-draft "パスワードが違ってもログインできてしまうバグを直して" --workspace ~/work/login
+    contract-draft "…" --workspace … --no-run        テストを走らせずに作る（repro と keep_passing を分けない）
+    contract-draft "…" --workspace … --json          下書きだけを JSON で出す（agent-run --contract に渡せる形）
+
+## なぜ要るか（ロードマップ Phase 7 の入口）
+
+proofcheck は契約が無いと「バグが直った」を PROVEN にできない。だが契約を毎回手で書くのは重く、
+書かれないまま走ると、全部 UNVERIFIED になる。**下書きを機械が出し、人は直すだけにする。**
+
+## 下書きであって、契約ではない
+
+規則は**依頼の文と作業場の中身だけ**を見る。モデルは使わない（同じ入力なら同じ下書き）。
+決められないものは決めずに、`人が決めること` に理由つきで残す。**推測で埋めた欄は `根拠` に
+「推定」と書く。** 人が読まずに使うと、推定した may_change が広すぎたときに嘘を通す。
+
+## 規則（どれも「なぜそう読むか」を根拠に書き出す）
+
+- 依頼が名指ししたファイル（作業場にあるもの）は may_change。「A を B に改名」は A と B
+- 名指しが無ければ、落ちているテスト・確かめ（check_*.py）が import・名指しするファイル、
+  依頼の `name()` を定義しているファイル、それも無く作業場の元ファイルが1つだけならそれ（推定）
+- テスト（test_*.py など）と確かめ（check_*.py）は、写しの上で一度走らせる。
+  いま落ちるテストは repro、いま落ちる確かめは must_pass、いま通るものは keep_passing
+- テストと確かめは must_not_change。依頼が名指ししていないシェルスクリプトも must_not_change
+  （本番に反映する道具を書き換えて「反映した」と言える形を塞ぐ）
+- 「A に B を足して」は、B の行があることと、もとの行が残っていることを must_pass に
+- 「直さなくてよい」「レビューだけ」は may_change を空に
+- 段（1〜5）を見積もる。外の状態（本番・送信）、人の判断（分かりやすく）、測れない目標（速く・安全・喜ぶ）は
+  契約では確かめられないので、`人が決めること` に書く
+"""
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+TEST_GLOBS = ("test_*.py", "*_test.py", "tests/*.py")
+CHECK_GLOBS = ("check_*.py",)
+DOC_EXT = (".md", ".txt", ".rst")
+SRC_EXT = (".py", ".js", ".mjs", ".ts", ".rb", ".go", ".rs", ".sh", ".json", ".toml", ".yaml", ".yml",
+           ".sql", ".html", ".css", ".cfg", ".ini")
+RE_FILE = re.compile(r"(?<![\w./-])(\.?[\w.-]*[\w]\.[A-Za-z][A-Za-z0-9]{0,5}|\.[A-Za-z][\w.-]+)(?![\w.-])")
+RE_RENAME = re.compile(r"(\S+?)\s*を\s*(\S+?)\s*に\s*(?:名前を変え|改名|リネーム|rename)", re.I)
+RE_ADD = re.compile(r"(\S+?)\s*に\s*(\S+?)\s*を\s*(?:足し|追加|加え)")
+RE_FUNC = re.compile(r"([A-Za-z_]\w*)\(\)")
+RE_REVIEW_ONLY = re.compile(r"直さなくて(?:よい|いい)|変更しないで|レビューだけ|指摘だけ|読むだけ")
+# 「X を作って」——まだ無いファイルを作る依頼
+RE_CREATE = re.compile(r"(\S+?)\s*を\s*(?:新しく|新規に)?\s*(?:作って|作成|作り|用意して)")
+# 「…と書いて」——中身として書く文字列
+RE_WRITE_TEXT = re.compile(r"[、,]\s*(.+?)\s*と書いて")
+# 「X の Y を Z に上げて／変えて」——Z を字面で確かめられる（数字か、括弧・引用符で囲んだもの）
+RE_SET_VALUE = re.compile(r"(\S+?)\s*の\s*\S+?\s*を\s*(\d[\w.%-]*|「[^」]+」|\"[^\"]+\")\s*に\s*(?:上げ|下げ|変え|し|設定|更新)")
+# 材料として名指ししたファイル（読む相手で、変える相手ではない）
+RE_INPUT_AFTER = r"\s*(?:に(?:ある|あります|書いてあ)|を(?:読んで|参考に|見て|元に)|の(?:内容|文面))"
+# 「migrations/ に書いて」——フォルダに新しく足す
+RE_DIR = re.compile(r"(?<![\w./-])([\w.-]+/)(?=\s*(?:に|へ))")
+# 段の見積もり。上の段ほど優先する（外の状態と測れない目標は、テストがあっても残る）
+RE_EXTERNAL = re.compile(r"本番|反映|デプロイ|deploy|送信|送って|送付|通知|Slack|メールを送|DB|データベース|push|公開|"
+                         r"流して|適用して|[\w.+-]+@[\w-]+\.[\w.]+", re.I)
+RE_JUDGE = re.compile(r"分かりやすく|わかりやすく|分かる|伝わる|読みやすく|見やすく|きれいに|綺麗に|丁寧に|自然な|親切")
+RE_VAGUE = re.compile(r"速く|高速|軽く|安全に|セキュリティ|喜ぶ|改善|いい感じ|良くして|よくして|最適|耐えられる|スケール|もっと")
+RE_KEEP_BEHAVIOR = re.compile(r"動きは変えない|挙動を変えない|動作を変えない|振る舞いを変えない")
+
+
+def ws_files(ws):
+    out = []
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules")]
+        for f in files:
+            out.append(os.path.relpath(os.path.join(root, f), ws))
+    return sorted(out)
+
+
+def match_any(rel, globs):
+    return any(fnmatch.fnmatch(rel, g) or fnmatch.fnmatch(os.path.basename(rel), g) for g in globs)
+
+
+def run_once(ws, cmd, timeout=20):
+    """写しの上で一度だけ走らせる。作業場そのものは触らない。→ 終了コード（時間切れは None）"""
+    with tempfile.TemporaryDirectory(prefix="draft-") as tmp:
+        w = os.path.join(tmp, "ws")
+        shutil.copytree(ws, w, symlinks=True)
+        try:
+            return subprocess.run(cmd, shell=True, cwd=w, capture_output=True, timeout=timeout,
+                                  env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp,
+                                       "PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8"}).returncode
+        except subprocess.TimeoutExpired:
+            return None
+
+
+def referenced_files(ws, rel, files):
+    """テスト・確かめが import する、または文字列で名指しする作業場のファイル。"""
+    try:
+        body = open(os.path.join(ws, rel), encoding="utf-8", errors="replace").read()
+    except OSError:
+        return []
+    mods = set(re.findall(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", body, re.M))
+    names = {m for pair in mods for m in pair if m}
+    out = []
+    for f in files:
+        if f == rel:
+            continue
+        stem = os.path.splitext(f)[0].replace(os.sep, ".")
+        if f.endswith(".py") and stem in names:
+            out.append(f)
+        # 文字列で出てくるだけでは足りない。open( で開くものだけ（check が除外のために
+        # '001_init.sql' と書いたのを、変えてよいファイルと読んだ。held-out L3-migration）
+        elif re.search(r"open\(\s*['\"]" + re.escape(f) + r"['\"]", body):
+            out.append(f)
+    return out
+
+
+def draft(request, ws, run=True):
+    files = ws_files(ws)
+    tests = [f for f in files if match_any(f, TEST_GLOBS)]
+    checks = [f for f in files if match_any(f, CHECK_GLOBS)]
+    verifiers = set(tests) | set(checks)
+    c = {"task": request.strip()[:60], "may_change": []}
+    why = {}       # 欄 → 根拠の文
+    human = []     # 人が決めること
+    level = 1
+
+    def add(key, val, reason):
+        lst = c.setdefault(key, [])
+        if val not in lst:
+            lst.append(val)
+            why.setdefault(key, []).append(f"{val}: {reason}")
+
+    # ── 変えてよい場所 ──
+    review_only = bool(RE_REVIEW_ONLY.search(request))
+    named = [m for m in RE_FILE.findall(request)]
+    rn = RE_RENAME.search(request)
+    if rn:
+        a, b = rn.group(1), rn.group(2)
+        for x in (a, b):
+            add("may_change", x, "依頼が改名の両端として名指しした")
+        add("must_pass", f"test -f {b}", "改名後の名前があること")
+        add("must_pass", f"test ! -e {a}", "改名前の名前が残っていないこと")
+    ad = RE_ADD.search(request)
+    if ad and ad.group(1) in files:
+        target, line = ad.group(1), ad.group(2)
+        add("must_pass", f"grep -qxF -- '{line}' {target}", "依頼が足すように言った行")
+        try:
+            olds = [l for l in open(os.path.join(ws, target), encoding="utf-8").read().splitlines() if l.strip()]
+        except OSError:
+            olds = []
+        for l in olds[:20]:
+            add("must_pass", f"grep -qxF -- '{l}' {target}", "「足して」なので、もとの行は残ること")
+    # 材料として名指ししたファイルは変える相手ではない。「文面は notice.txt にあります」の
+    # notice.txt を may_change にしたら、文面を書き換えて送った回が PROVEN になった（held-out L3-mail）
+    inputs = [f for f in named if f in files and re.search(re.escape(f) + RE_INPUT_AFTER, request)]
+    for f in inputs:
+        add("must_not_change", f, "依頼が材料として名指しした（読む相手で、変える相手ではない）")
+    goal_checks = bool(rn or (ad and ad.group(1) in files))
+    cr = RE_CREATE.search(request)
+    if cr and not review_only:
+        new = next((f for f in RE_FILE.findall(cr.group(1)) if f not in files), None)
+        if new:
+            add("may_change", new, "依頼が作るように言った")
+            add("must_pass", f"test -f {new}", "作ったファイルがあること")
+            goal_checks = True
+            wt = RE_WRITE_TEXT.search(request)
+            if wt:
+                add("must_pass", f"grep -qF -- '{wt.group(1).strip()}' {new}", "依頼が書くように言った中身")
+    sv = RE_SET_VALUE.search(request)
+    if sv and sv.group(1) in files and not review_only:
+        v = sv.group(2).strip("「」\"")
+        add("must_pass", f"grep -qF -- '{v}' {sv.group(1)}", "依頼が変えるように言った値が入っていること")
+        goal_checks = True
+    for dm in RE_DIR.findall(request):
+        d = dm.rstrip("/")
+        olds = [f for f in files if f.startswith(d + "/")]
+        if olds and not review_only:
+            add("may_change", f"{d}/*", "依頼が足す先として名指ししたフォルダ")
+            for f in olds:
+                add("must_not_change", f, "フォルダに足す依頼なので、もとからある中身は変えない")
+    if not review_only:
+        for f in named:
+            if f in inputs:
+                continue
+            if f in files and f not in verifiers:
+                add("may_change", f, "依頼が名指しした")
+            elif f in files and f in verifiers:
+                human.append(f"{f} はテスト・確かめなのに依頼が名指ししている。変えてよいなら must_not_change から外す")
+
+    # ── テストと確かめを一度走らせて振り分ける ──
+    failing = []
+    for f in tests + checks:
+        cmd = f"python3 {f}"
+        if not run:
+            add("keep_passing" if f in tests else "must_pass", cmd, "走らせずに作ったので振り分けていない（要確認）")
+            continue
+        code = run_once(ws, cmd)
+        if code is None:
+            human.append(f"{cmd} が 20 秒で終わらなかった。契約に入れるか決める")
+        elif code != 0 and f in tests:
+            add("repro", cmd, f"いま落ちる（終了コード {code}）ので、直れば通るはずのテスト")
+            failing.append(f)
+        elif code != 0:
+            add("must_pass", cmd, f"いま落ちる確かめ（終了コード {code}）。終われば通るはず")
+            failing.append(f)
+        else:
+            add("keep_passing", cmd, "いま通るので、作業のあとも通るべき")
+
+    if not review_only and not c["may_change"]:
+        for f in failing:
+            for g in referenced_files(ws, f, files):
+                if g not in verifiers:
+                    add("may_change", g, f"落ちている {f} が使うファイル（推定）")
+    if not review_only and not c["may_change"]:
+        for fn in RE_FUNC.findall(request):
+            for f in files:
+                if f.endswith(".py") and f not in verifiers:
+                    try:
+                        if re.search(rf"^\s*def\s+{re.escape(fn)}\s*\(", open(os.path.join(ws, f)).read(), re.M):
+                            add("may_change", f, f"依頼の {fn}() を定義している（推定）")
+                    except OSError:
+                        pass
+    if not review_only and not c["may_change"]:
+        # **「元ファイルが1つだけならそれ」と推定してはいけない。**作るはずのファイルを読み損ねたとき、
+        # 無関係な app.py を may_change にし、その py_compile だけで封印して、
+        # 何もしなかった回を PROVEN にした（held-out L1-settings、2026-10-01）
+        human.append("変えてよい場所を決められない（依頼が名指ししていない）。may_change を書く")
+    if review_only:
+        why["may_change"] = ["空: 依頼が「直さなくてよい」と言っている"]
+
+    # ── 変えてはいけない場所 ──
+    if any(fnmatch.fnmatch(os.path.basename(t), "test_*.py") for t in tests):
+        add("must_not_change", "test_*.py", "テストを書き換えて通す形を塞ぐ")
+    if checks:
+        add("must_not_change", "check_*.py", "確かめを書き換えて通す形を塞ぐ")
+    for f in files:
+        if f.endswith(".sh") and f not in c["may_change"]:
+            add("must_not_change", f, "依頼が名指ししていない実行用スクリプト（中身を変えて「反映した」と言えないように）")
+
+    # ── 中身が壊れていないこと（安い確かめ） ──
+    for f in c["may_change"]:
+        if f.endswith(".py") and f in files and not any(f in x for x in c.get("must_pass", [])):
+            add("must_pass", f"python3 -m py_compile {f}", "変えてよい Python が少なくとも読み込めること")
+        elif f.endswith(DOC_EXT + (".html",)) and f in files and not rn:
+            add("must_pass", f"test -s {f}", "空にしていないこと")
+    if review_only:
+        for f in files:
+            if f.endswith(".py") and f not in verifiers:
+                add("must_pass", f"python3 -m py_compile {f}", "レビューだけなので、壊していないこと")
+
+    # ── 段と、人が決めること ──
+    # 段2は「テストがあれば証明できる」。確かめ（check_*.py）は OS の事実を見るだけなので段1のまま
+    if c.get("repro") or c.get("keep_passing"):
+        level = 2
+    elif not goal_checks and not checks:
+        level = max(level, 2)
+    if RE_EXTERNAL.search(request):
+        level = 3
+        human.append("作業場の外（本番・送信先）の状態は、この契約では確かめられない。"
+                     "外を観測する手段（受け取った側の記録など）を足すか、外は UNVERIFIED のままと決める")
+    if not (goal_checks or c.get("repro") or c.get("keep_passing") or failing) and c.get("must_pass"):
+        human.append("確かめが「壊していない」（py_compile・test -s）しか無く、頼んだことが済んだかは見ていない。"
+                     "このまま封印すると、何もしなかった回も PROVEN になる")
+    if review_only:
+        level = max(level, 4)
+        human.append("指摘の中身が正しいか・足りているかは人が読む。契約が確かめるのは「何も変えていない」ことだけ")
+    if RE_JUDGE.search(request):
+        level = max(level, 4)
+        human.append("「" + RE_JUDGE.search(request).group(0) + "」は人の判断が要る。読んだ人の合否を契約の外で残す")
+    if RE_VAGUE.search(request):
+        level = 5
+        human.append("「" + RE_VAGUE.search(request).group(0) + "」は測れる基準が無い。"
+                     "時間の上限・直すべき具体的な問題など、通る／落ちるで書ける形にする")
+    if RE_KEEP_BEHAVIOR.search(request) and not c.get("keep_passing"):
+        human.append("「動きを変えない」と言っているが、いま通るテストが無い。動きを固定するテストを足す")
+    if c.get("repro") is None and level == 2 and not c.get("keep_passing"):
+        human.append("落ちるテストが無いので「バグが直った」は PROVEN にならない。再現テストを足す")
+
+    if not any(c.get(k) for k in ("repro", "must_pass", "keep_passing")):
+        human.append("確かめるコマンドが1本も作れなかった（このままでは封印できない）。"
+                     "終わったと言える条件を must_pass に書く")
+
+    return {"contract": c, "level": level, "根拠": why, "人が決めること": human, "draft": True}
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="contract-draft", description="依頼と作業場から契約の下書きを作る")
+    p.add_argument("request")
+    p.add_argument("--workspace", required=True)
+    p.add_argument("--no-run", action="store_true", help="テストを走らせない")
+    p.add_argument("--json", action="store_true", help="契約だけを JSON で出す")
+    a = p.parse_args(argv)
+    if not os.path.isdir(a.workspace):
+        print(f"contract-draft: 作業場が無い: {a.workspace}", file=sys.stderr)
+        return 3
+    d = draft(a.request, a.workspace, run=not a.no_run)
+    if a.json:
+        print(json.dumps(d["contract"], ensure_ascii=False, indent=1))
+        return 0
+    print(f"段の見積もり: {d['level']}")
+    print(json.dumps(d["contract"], ensure_ascii=False, indent=1))
+    print("\n根拠:")
+    for k, rs in d["根拠"].items():
+        for r in rs:
+            print(f"  {k}  {r}")
+    print("\n人が決めること:" if d["人が決めること"] else "\n人が決めること: なし")
+    for h in d["人が決めること"]:
+        print(f"  - {h}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
