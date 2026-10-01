@@ -7,7 +7,7 @@ install — このMacに見張りを入れる。
     ./install --uninstall  外す
 
 やること:
-  1. guards/* を ~/bin に置く
+  1. 見張り一式（GUARDS）を ~/bin に置く
   2. launchd/*.template から plist を作って ~/Library/LaunchAgents に置く
   3. launchctl に登録して走らせる
   4. 知らせ先（Discord）が設定されているか確かめる
@@ -53,7 +53,7 @@ def do_install():
     os.makedirs(AGENTS, exist_ok=True)
 
     for name in GUARDS:
-        src = os.path.join(HERE, "guards", name)
+        src = os.path.join(HERE, name)
         dst = os.path.join(BIN, name)
         shutil.copy2(src, dst)
         os.chmod(dst, 0o755)

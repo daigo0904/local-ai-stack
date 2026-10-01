@@ -35,7 +35,7 @@ Mac 1台の中だけで動く AI の生活基盤。**外のAPIに一度も出ず
 brew install ollama && ollama pull gemma4:26b
 npm i -g openclaw
 
-git clone https://github.com/ahogorirappa/local-ai-stack
+git clone https://github.com/daigo0904/local-ai-stack
 cd local-ai-stack
 ./install              # 全部
 ./install guards       # 一部だけ（guards / openclaw / tools / qwc）
@@ -56,7 +56,7 @@ LINE_CHANNEL_ACCESS_TOKEN=line channel access token please
 ## 動かしてみる
 
 ```sh
-claw status      # 全体の状態。見張り3つの心拍も出る
+claw status      # 全体の状態。見張り4つの心拍も出る
 claw chat        # ターミナルでそのまま話す
 qwc              # コーディング（そのまま雑談もできる）
 voice-ai         # Option キーを押している間だけ聞く音声アシスタント
