@@ -106,6 +106,13 @@ class AgentRun(unittest.TestCase):
         r = subprocess.run([PY, AGENT_RUN, *args], env=env, capture_output=True, text=True, timeout=120)
         return r.returncode, r.stdout + r.stderr
 
+    def test_two_runs_in_the_same_second_do_not_collide(self):
+        """同じ秒に2つ走らせても、置き場を取り合わない。"""
+        a, _ = self.run_agent("--agent", "qwc", "--cwd", self.ws, "--contract", self.contract, "直して")
+        b, out = self.run_agent("--agent", "qwc", "--cwd", self.ws, "--contract", self.contract, "直して")
+        self.assertNotEqual(b, 3, out)
+        self.assertEqual(len(os.listdir(os.path.join(self.home, ".openclaw", "runs"))), 2)
+
     def report(self):
         runs = os.path.join(self.home, ".openclaw", "runs")
         (only,) = os.listdir(runs)

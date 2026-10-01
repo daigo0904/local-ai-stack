@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+run_corpus — 検証コーパスを回し、5段ごとに「どこまで証明できたか」を表にする。
+
+    run_corpus --self-check              エージェントを使わずに、各課題の「正直」「嘘」の解き方を当て、
+                                         契約と申告が期待どおりに区別できるかを確かめる（コーパス自身の点検）
+    run_corpus --agent qwc [--fast]      agent-run で全課題を qwc に解かせて集計する
+    run_corpus --agent codex             同じく Codex（ollama で動かす）
+    run_corpus --only L2-login,L3-deploy 一部だけ
+
+課題は verify/corpus/tasks/<id>/ に1つずつある（task.json と workspace/）。
+段（level）はロードマップ Phase 5 の5段:
+    1 OS の事実だけで証明できる      2 追加テストがあれば証明できる
+    3 外部の状態が要る               4 人の判断が要る        5 機械では判定困難
+
+本番の集計で見たいのは「エージェントの出来」ではなく、**段ごとに、PROVEN まで届いた割合と、
+UNVERIFIED に残った理由**である。段が上がるほど PROVEN が減り、UNVERIFIED の理由が
+「外部の状態」「人の判断」に寄っていくはず——それがこの層の保証境界の実測になる。
+
+結果は verify/corpus/results/<日時>-<モード>.json と .md に置く。
+"""
+
+import argparse
+import collections
+import contextlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TASKS = os.path.join(HERE, "corpus", "tasks")
+RESULTS = os.path.join(HERE, "corpus", "results")
+PROOFCHECK = os.path.join(HERE, "proofcheck")
+AGENT_RUN = os.path.join(HERE, "agent-run")
+LEVELS = {1: "OS の事実だけで証明できる", 2: "追加テストがあれば証明できる", 3: "外部の状態が要る",
+          4: "人の判断が要る", 5: "機械では判定困難"}
+# 壁の記録が無いと必ず UNVERIFIED になる行。「契約が区別できるか」を見るときは外す
+WALL_ITEMS = {"outside", "guardrun_mark", "two_diffs", "openshell_wall"}
+
+
+def load_tasks(only=None):
+    out = []
+    for name in sorted(os.listdir(TASKS)):
+        if only and name not in only:
+            continue
+        with open(os.path.join(TASKS, name, "task.json")) as f:
+            out.append(json.load(f))
+    return out
+
+
+def contract_verdict(report):
+    vs = [i["verdict"] for i in report["contract"] if i["id"] not in WALL_ITEMS]
+    if "DISPROVEN" in vs:
+        return "DISPROVEN"
+    if "UNVERIFIED" in vs or not vs:
+        return "UNVERIFIED"
+    return "PROVEN"
+
+
+def claim_verdicts(report):
+    """申告の種類ごとの判定。同じ種類は1つにまとまっている（proofcheck の decompose）。"""
+    kinds = {"ファイルを変更した": "changed_files", "テストを実行した": "ran_tests", "テストが通った": "tests_passed",
+             "バグが解消された": "bug_fixed", "作業場の外を変えた・送った": "external",
+             "問題が無い（不在の主張）": "absence", "その他の完了の申告": "other"}
+    out = {}
+    for i in report["claims"]:
+        for label, k in kinds.items():
+            if i["text"].startswith(label):
+                out[k] = i["verdict"]
+    return out
+
+
+def proofcheck(*args):
+    r = subprocess.run([sys.executable, PROOFCHECK, *args], capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def seal(task, tmp):
+    ws = os.path.join(tmp, "ws")
+    shutil.copytree(os.path.join(TASKS, task["id"], "workspace"), ws)
+    cpath = os.path.join(tmp, "contract.json")
+    with open(cpath, "w") as f:
+        json.dump(task["contract"], f, ensure_ascii=False)
+    run = os.path.join(tmp, "proof")
+    code, out, err = proofcheck("seal", cpath, "--workspace", ws, "--run", run)
+    if code != 0:
+        raise RuntimeError(f"封印できない: {err or out}")
+    sid = next(l.split()[-1] for l in out.splitlines() if l.startswith("封印ID"))
+    return ws, run, sid, cpath
+
+
+def self_check(tasks):
+    rows = []
+    for t in tasks:
+        for sc in t["self_check"]:
+            with tempfile.TemporaryDirectory(prefix="corpus-") as tmp:
+                ws, run, sid, _ = seal(t, tmp)
+                for rel, body in sc.get("files", {}).items():
+                    p = os.path.join(ws, rel)
+                    os.makedirs(os.path.dirname(p), exist_ok=True)
+                    with open(p, "w") as f:
+                        f.write(body)
+                for rel in sc.get("delete", []):
+                    os.remove(os.path.join(ws, rel))
+                code, out, err = proofcheck("judge", run, "--seal-id", sid, "--claim", sc["claim"], "--json")
+                if code not in (0, 1, 2):
+                    rows.append({"task": t["id"], "level": t["level"], "case": sc["name"], "ok": False,
+                                 "why": f"判定できない: {err.strip() or out.strip()}"})
+                    continue
+                rep = json.loads(out)
+                got_c, got_k = contract_verdict(rep), claim_verdicts(rep)
+                want = sc["expect"]
+                bad = []
+                if got_c != want["契約"]:
+                    bad.append(f"契約 {got_c}（期待 {want['契約']}）")
+                for k, v in want["申告"].items():
+                    if got_k.get(k) != v:
+                        bad.append(f"申告 {k} {got_k.get(k)}（期待 {v}）")
+                rows.append({"task": t["id"], "level": t["level"], "case": sc["name"], "ok": not bad,
+                             "why": "; ".join(bad), "contract": got_c, "claims": got_k})
+    return rows
+
+
+def run_agent(tasks, agent, fast):
+    rows = []
+    for t in tasks:
+        with tempfile.TemporaryDirectory(prefix="corpus-") as tmp:
+            ws = os.path.join(tmp, "ws")
+            shutil.copytree(os.path.join(TASKS, t["id"], "workspace"), ws)
+            cpath = os.path.join(tmp, "contract.json")
+            with open(cpath, "w") as f:
+                json.dump(t["contract"], f, ensure_ascii=False)
+            r = subprocess.run([sys.executable, AGENT_RUN, "--agent", agent, "--cwd", ws,
+                                "--contract", cpath, t["request"]], capture_output=True, text=True)
+            run_dir = next((l.split("記録:", 1)[1].strip() for l in r.stdout.splitlines()
+                            if l.startswith("記録:")), None)
+            rep_path = os.path.join(run_dir, "proof", "report.json") if run_dir else None
+            if not rep_path or not os.path.exists(rep_path):
+                rows.append({"task": t["id"], "level": t["level"], "error": (r.stderr or r.stdout)[-400:]})
+                continue
+            with open(rep_path) as f:
+                rep = json.load(f)
+            # --fast で判定し直したいときは、同じ封印に judge をもう一度かける
+            if fast:
+                sealf = os.path.join(run_dir, "proof", "seal.json")
+                if os.path.exists(sealf):
+                    code, out, _ = proofcheck("judge", os.path.join(run_dir, "proof"), "--fast", "--json",
+                                              "--codex-jsonl", os.path.join(run_dir, "events.jsonl"))
+                    if out.strip():
+                        rep = json.loads(out)
+            rows.append({"task": t["id"], "level": t["level"], "run": run_dir, "verdict": rep["verdict"],
+                         "contract": contract_verdict(rep), "claims": claim_verdicts(rep),
+                         "missing": [m for i in rep["claims"] + rep["contract"] for m in i["missing"]],
+                         "cost": rep.get("cost")})
+    return rows
+
+
+def summarize(rows, mode):
+    lines = [f"# 検証コーパスの結果（{mode}・{datetime.now():%Y-%m-%d %H:%M}）", ""]
+    if mode == "self-check":
+        ok = sum(r["ok"] for r in rows)
+        lines += [f"自己点検: {ok}/{len(rows)} 件が期待どおり", "",
+                  "| 段 | 課題 | 解き方 | 契約 | 結果 |", "| --- | --- | --- | --- | --- |"]
+        for r in rows:
+            lines.append(f"| {r['level']} | {r['task']} | {r['case']} | {r.get('contract', '')} | "
+                         f"{'○' if r['ok'] else '× ' + r['why']} |")
+        return "\n".join(lines) + "\n"
+    lines += ["全体＝申告と契約の全行。契約＝壁の記録が要る行（作業場の外など）を除いた契約の行。",
+              "形式は P／D／U（PROVEN／DISPROVEN／UNVERIFIED の件数）。", "",
+              "| 段 | 中身 | 課題数 | 全体 P／D／U | 契約 P／D／U |",
+              "| --- | --- | --: | --- | --- |"]
+    for lv, name in LEVELS.items():
+        rs = [r for r in rows if r["level"] == lv and "error" not in r]
+        w = collections.Counter(r["verdict"] for r in rs)
+        c = collections.Counter(r["contract"] for r in rs)
+        lines.append(f"| {lv} | {name} | {len(rs)} | {w['PROVEN']}／{w['DISPROVEN']}／{w['UNVERIFIED']} | "
+                     f"{c['PROVEN']}／{c['DISPROVEN']}／{c['UNVERIFIED']} |")
+    miss = collections.Counter(m for r in rows if "error" not in r for m in r["missing"])
+    lines += ["", "## UNVERIFIED に残った理由（多い順）", ""]
+    lines += [f"- {n} 件: {m}" for m, n in miss.most_common(10)] or ["- なし"]
+    errs = [r for r in rows if "error" in r]
+    if errs:
+        lines += ["", "## 走らなかった課題", ""] + [f"- {r['task']}: {r['error'][-200:]}" for r in errs]
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="run_corpus")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--self-check", action="store_true")
+    g.add_argument("--agent", choices=["qwc", "codex"])
+    p.add_argument("--fast", action="store_true")
+    p.add_argument("--only", help="課題の id をカンマ区切りで")
+    p.add_argument("--no-save", action="store_true", help="結果を results/ に書かない")
+    a = p.parse_args(argv)
+    tasks = load_tasks(set(a.only.split(",")) if a.only else None)
+    mode = "self-check" if a.self_check else a.agent + ("-fast" if a.fast else "")
+    rows = self_check(tasks) if a.self_check else run_agent(tasks, a.agent, a.fast)
+    md = summarize(rows, mode)
+    print(md)
+    if not a.no_save:
+        os.makedirs(RESULTS, exist_ok=True)
+        stem = os.path.join(RESULTS, f"{datetime.now():%Y%m%d-%H%M%S}-{mode}")
+        with open(stem + ".json", "w") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=1)
+        with open(stem + ".md", "w") as f:
+            f.write(md)
+    if a.self_check:
+        return 0 if all(r["ok"] for r in rows) else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

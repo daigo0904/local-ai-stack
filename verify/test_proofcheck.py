@@ -114,6 +114,56 @@ class TestDecompose(unittest.TestCase):
         self.assertEqual([c["kind"] for c in pc.decompose("目標を達成しました")], ["other"])
 
 
+class TestDecomposeScope(unittest.TestCase):
+    """検証コーパスの自己点検で見つけた分解の穴（2026-10-01）。"""
+
+    def kinds(self, text):
+        return [c["kind"] for c in pc.decompose(text)]
+
+    def test_numbers_are_not_file_names(self):
+        self.assertEqual(pc.decompose("税率を 0.08 から 0.10 に変更しました。")[0]["files"], [])
+        self.assertEqual(pc.decompose("バージョンを 1.2.3 に上げました。")[0]["files"], [])
+
+    def test_more_ways_to_say_changed(self):
+        for t in ("app.py の print を2か所削除しました。", "notes.md に名前を変えました。",
+                  "calc.py の変数名を読みやすくしました。", "login.html にラベルを付け、文言を改善しました。"):
+            self.assertIn("changed_files", self.kinds(t), t)
+
+    def test_external_claims_are_not_judged_by_the_workspace(self):
+        self.assertEqual(self.kinds("UPDATE 文を書き、本番 DB で実行して、id=42 のメールを更新しました。"),
+                         ["changed_files", "external"])
+        self.assertEqual(self.kinds("Slack の #release に通知を送りました。"), ["external"])
+        self.assertEqual(self.kinds("I deployed it to production."), ["external"])
+
+    def test_file_names_are_not_external(self):
+        self.assertEqual(self.kinds("auth.py と db.py を修正しました。"), ["changed_files"])
+        self.assertEqual(self.kinds("deploy.sh と server.py を修正しました。"), ["changed_files"])
+
+    def test_absence_claims(self):
+        self.assertIn("absence", self.kinds("コマンド注入を直しました。ほかに問題はありません。"))
+        self.assertIn("absence", self.kinds("There are no other issues."))
+
+    def test_external_and_absence_are_never_proven(self):
+        for k in ("external", "absence"):
+            r = pc.decide(k, [])
+            self.assertEqual(r["verdict"], pc.UNVERIFIED)
+            self.assertTrue(r["missing"])
+
+
+class TestCorpusSelfCheck(unittest.TestCase):
+    """検証コーパスの全課題で、正直と嘘の解き方を契約と申告が期待どおりに区別できる。"""
+
+    def test_corpus(self):
+        loader = importlib.machinery.SourceFileLoader("run_corpus", os.path.join(HERE, "run_corpus"))
+        spec = importlib.util.spec_from_loader("run_corpus", loader)
+        rc = importlib.util.module_from_spec(spec)
+        loader.exec_module(rc)
+        rows = rc.self_check(rc.load_tasks())
+        bad = [f"{r['task']} {r['case']}: {r['why']}" for r in rows if not r["ok"]]
+        self.assertEqual(bad, [])
+        self.assertEqual({r["level"] for r in rows}, {1, 2, 3, 4, 5})
+
+
 class TestHonestFix(Case):
     def test_without_receipt_is_unverified_not_proven(self):
         self.seal()

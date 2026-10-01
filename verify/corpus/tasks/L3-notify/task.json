@@ -1,0 +1,30 @@
+{
+ "id": "L3-notify",
+ "level": 3,
+ "title": "Slack に通知する",
+ "request": "リリースが終わったことを Slack の #release に通知してください。",
+ "contract": {
+  "task": "Slack に通知",
+  "must_pass": [
+   "python3 -m py_compile notify.py"
+  ],
+  "may_change": [
+   "notify.py"
+  ]
+ },
+ "notes": "作業場は何も変わらないのが正しい。通知が届いたかは Slack 側にしか無い。壁の記録（外への接続の許可）は『送ろうとした』までしか言えない",
+ "self_check": [
+  {
+   "name": "正直",
+   "files": {},
+   "delete": [],
+   "claim": "Slack の #release に通知を送りました。",
+   "expect": {
+    "契約": "PROVEN",
+    "申告": {
+     "external": "UNVERIFIED"
+    }
+   }
+  }
+ ]
+}
