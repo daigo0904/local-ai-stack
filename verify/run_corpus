@@ -69,7 +69,8 @@ def claim_verdicts(report):
     """申告の種類ごとの判定。同じ種類は1つにまとまっている（proofcheck の decompose）。"""
     kinds = {"ファイルを変更した": "changed_files", "テストを実行した": "ran_tests", "テストが通った": "tests_passed",
              "バグが解消された": "bug_fixed", "作業場の外を変えた・送った": "external",
-             "問題が無い（不在の主張）": "absence", "その他の完了の申告": "other"}
+             "問題が無い（不在の主張）": "absence", "動きを変えていない": "behavior_kept",
+             "その他の完了の申告": "other"}
     out = {}
     for i in report["claims"]:
         for label, k in kinds.items():
