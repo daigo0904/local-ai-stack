@@ -437,6 +437,124 @@ def merge_evidence(receipt, harness):
     return out
 
 
+# ── NVIDIA OpenShell の監査記録（OCSF）の取り込み口 ─────────────────
+#
+# OpenShell（github.com/NVIDIA/OpenShell）は、砂場の中の監督プロセスが OCSF v1.8 の
+# JSONL を /var/log/openshell-ocsf.YYYY-MM-DD.log に書く（ocsf_json_enabled を true に）。
+# 調べた範囲（2026-10-01・main 021400b）で、ここから取れるもの／取れないもの:
+#   取れる   Process Activity 1007   エージェント全体（ワークロード）の起動・終了・時間切れ
+#            Network / HTTP 4001・4002 外への接続の許可・拒否
+#            Detection Finding 2004  方針の回り込みなどの検知
+#            Config 5019             「Landlock ruleset built [rules_applied:N skipped:M]」
+#   取れない 中で走った1本1本の命令、ファイルの変化（File System Activity は出さない）
+# だから「テストを実行した」はハーネスの記録、「何が変わったか」は封印からの差分が担う。
+#
+# **既定の landlock.compatibility は best_effort で、Landlock が掛からなければ
+# ファイルの制限なしで走る**（記録に「Running WITHOUT filesystem restrictions」が残るだけ）。
+# 作業場の外を壁の保証として PROVEN にするのは、Landlock が掛かった記録があり、掛からなかった
+# 記録が無く、方針の read_write が作業場の中だけのときに限る。
+
+LANDLOCK_OK = re.compile(r"Landlock ruleset built \[rules_applied:(\d+) skipped:(\d+)\]")
+LANDLOCK_NG = re.compile(r"WITHOUT filesystem restrictions|restrict_self failed|zero valid paths|"
+                         r"Landlock unavailable", re.I)
+
+
+def load_ocsf(path):
+    landlock_ok, landlock_ng, denials, findings, workload = [], [], [], [], {}
+    seen_openshell = False
+    with open(path) as f:
+        for row in f:
+            row = row.strip()
+            if not row:
+                continue
+            try:
+                e = json.loads(row)
+            except ValueError:
+                continue
+            product = ((e.get("metadata") or {}).get("product") or {}).get("name", "")
+            if "OpenShell" in product:
+                seen_openshell = True
+            msg = str(e.get("message") or "")
+            cls = e.get("class_uid")
+            if LANDLOCK_OK.search(msg):
+                landlock_ok.append(msg)
+            if LANDLOCK_NG.search(msg) or LANDLOCK_NG.search(str(e.get("status_detail") or "")):
+                landlock_ng.append(msg)
+            if cls in (4001, 4002) and str(e.get("action", "")).lower() == "denied":
+                denials.append(msg or str(e.get("dst_endpoint")))
+            if cls == 2004 and int(e.get("severity_id") or 0) >= 4:   # High 以上
+                findings.append(msg)
+            if cls == 1007:
+                if e.get("exit_code") is not None:
+                    workload["exit_code"] = e["exit_code"]
+                if re.search(r"time(?:d)? ?out", msg, re.I):
+                    workload["timed_out"] = True
+    return {"source": "OpenShell の監査記録（OCSF）", "seen_openshell": seen_openshell,
+            "landlock_ok": landlock_ok, "landlock_ng": landlock_ng,
+            "denials": denials, "findings": findings, "workload": workload}
+
+
+def load_openshell_policy(path):
+    """方針の YAML から filesystem_policy だけを読む（PyYAML に頼らない最小の読み方）。
+
+    読むのは include_workdir と read_write（[a, b] の形と「- a」の形）。分からない書き方なら
+    None を返し、作業場の外については何も言わない。"""
+    try:
+        text = open(path).read()
+    except OSError:
+        return None
+    m = re.search(r"^filesystem_policy:\s*\n((?:[ \t]+.*\n?)*)", text, re.M)
+    if not m:
+        # filesystem_policy が無ければ、OpenShell の既定は include_workdir: true で read_write は空
+        return {"include_workdir": True, "read_write": [], "explicit": False}
+    body = m.group(1)
+    inc = re.search(r"include_workdir:\s*(true|false)", body)
+    rw = []
+    flow = re.search(r"read_write:\s*\[([^\]]*)\]", body)
+    if flow:
+        rw = [x.strip().strip("'\"") for x in flow.group(1).split(",") if x.strip()]
+    else:
+        block = re.search(r"read_write:\s*\n((?:[ \t]+-\s*.*\n?)*)", body)
+        if block:
+            rw = [x.strip().lstrip("-").strip().strip("'\"") for x in block.group(1).splitlines() if x.strip()]
+        elif re.search(r"read_write:", body):
+            return None
+    return {"include_workdir": (inc.group(1) == "true") if inc else False, "read_write": rw, "explicit": True}
+
+
+def judge_openshell(o, policy, workspace):
+    """OpenShell の記録から言える契約の行。強さはカーネル（壁の外の監督プロセスの記録）。"""
+    out = []
+    ev_wall = [f"Landlock が掛かった: {o['landlock_ok'][-1]}"] if o["landlock_ok"] else []
+    ev_wall += [f"外への接続を拒んだ: {len(o['denials'])} 件"] if o["denials"] else []
+    if o["landlock_ng"]:
+        out.append(item("openshell_wall", "OpenShell の壁（Landlock）が掛かっていた", DISPROVEN, DETERMINISTIC,
+                        [f"掛からなかった記録: {o['landlock_ng'][0]}"] + ev_wall))
+    elif o["findings"]:
+        out.append(item("openshell_wall", "OpenShell の壁（Landlock）が掛かっていた", DISPROVEN, DETERMINISTIC,
+                        [f"重大な検知: {x}" for x in o["findings"][:3]] + ev_wall))
+    elif o["landlock_ok"]:
+        out.append(item("openshell_wall", "OpenShell の壁（Landlock）が掛かっていた", PROVEN, DETERMINISTIC, ev_wall))
+    else:
+        out.append(item("openshell_wall", "OpenShell の壁（Landlock）が掛かっていた", UNVERIFIED, DETERMINISTIC, ev_wall,
+                        ["「Landlock ruleset built」の記録（ocsf_json_enabled を true にした砂場の記録）"]))
+    return out
+
+
+def openshell_outside(o, policy, workspace):
+    """作業場の外を壁の保証として言えるか。言えれば根拠の文を、言えなければ None と理由を返す。"""
+    if not o or o["landlock_ng"] or not o["landlock_ok"]:
+        return None, "OpenShell の記録で Landlock が掛かったと確かめられない"
+    if policy is None:
+        return None, "OpenShell の方針（--openshell-policy）。書ける場所が作業場の中だけかを確かめるため"
+    ws = os.path.realpath(workspace)
+    outside = [p for p in policy["read_write"]
+               if not (os.path.realpath(p) == ws or os.path.realpath(p).startswith(ws + os.sep))]
+    if outside:
+        return None, f"OpenShell の方針が作業場の外への書き込みを許している: {', '.join(outside)}"
+    return ("OpenShell: Landlock が掛かり、方針の read_write は作業場の中だけ"
+            "（ほかの場所への書き込みはカーネルが断る。ネットワーク規則があると既定の場所が足される点に注意）"), None
+
 # ── 判定 ────────────────────────────────────────────────
 
 def item(ident, text, verdict, basis, evidence=(), missing=()):
@@ -516,7 +634,16 @@ def judge_contract(c, d, final_runs, base_runs, receipt):
                     [f"置いた・変えた: {', '.join(hooks)}"] if hooks else ["該当の変更なし"]))
 
     oc = receipt.get("outside_changes") if receipt else None
-    if oc is None:
+    os_basis, os_missing = (None, None)
+    if receipt and receipt.get("openshell") is not None:
+        os_basis, os_missing = openshell_outside(receipt["openshell"], receipt.get("openshell_policy"),
+                                                 receipt.get("seal_workspace", ""))
+        if oc is None and os_basis:
+            oc = 0
+            receipt["outside_basis"] = os_basis
+    if oc is None and os_missing:
+        out.append(item("outside", "作業場の外を変えていない", UNVERIFIED, DETERMINISTIC, [], [os_missing]))
+    elif oc is None:
         why = ["作業場の外の変化の記録（guardrun の受領証）"]
         if receipt and receipt.get("mark") in ("中断", "拒否"):
             why = [f"受領証の判定が「{receipt['mark']}」で、壁の中で最後まで見届けていない"]
@@ -526,6 +653,9 @@ def judge_contract(c, d, final_runs, base_runs, receipt):
                         PROVEN if oc == 0 else DISPROVEN, DETERMINISTIC,
                         [receipt.get("outside_basis") or f"受領証: 作業場の外で変わった数 {oc}"]))
 
+    if receipt and receipt.get("openshell") is not None:
+        out.extend(judge_openshell(receipt["openshell"], receipt.get("openshell_policy"),
+                                   receipt.get("seal_workspace", "")))
     if receipt and receipt.get("mark"):
         out.append(judge_mark(receipt))
     if receipt and receipt.get("receipt_diff") is not None:
@@ -821,6 +951,15 @@ def cmd_judge(a):
         # 申告を渡されなければ、ハーネスに残ったエージェントの最後の発言を申告として読む
         claim_text = harness["agent_message"]
     receipt = merge_evidence(load_receipt(a.receipt) if a.receipt else None, harness)
+    if a.ocsf:
+        o = load_ocsf(a.ocsf)
+        if not o["seen_openshell"]:
+            print("proofcheck: --ocsf の記録に OpenShell のものが1行も無い", file=sys.stderr)
+            return EXIT_USAGE
+        receipt = dict(receipt or {"source": o["source"], "processes": None, "outside_changes": None})
+        receipt["openshell"] = o
+        receipt["openshell_policy"] = load_openshell_policy(a.openshell_policy) if a.openshell_policy else None
+        receipt["seal_workspace"] = seal["workspace"]
     rw = (receipt or {}).get("workspace")
     if rw and os.path.realpath(rw) != os.path.realpath(seal["workspace"]):
         # 別の走りの受領証で判定すると、他人の差分で採点することになる
@@ -926,6 +1065,8 @@ def main(argv=None):
     g.add_argument("--claim", help="エージェントの申告（完了報告の文）")
     g.add_argument("--claim-file")
     j.add_argument("--receipt", help="guardrun の受領証（JSON）")
+    j.add_argument("--ocsf", help="NVIDIA OpenShell の監査記録（/var/log/openshell-ocsf.*.log、OCSF JSONL）")
+    j.add_argument("--openshell-policy", help="その砂場の OpenShell の方針（YAML）。作業場の外を言うのに要る")
     j.add_argument("--codex-jsonl", help="codex exec --json（または qwc --events）の記録。--claim が無ければ最後の発言を申告に使う")
     j.add_argument("--seal-id", help="seal が出した封印ID。違えば判定しない")
     j.add_argument("--json", action="store_true")
