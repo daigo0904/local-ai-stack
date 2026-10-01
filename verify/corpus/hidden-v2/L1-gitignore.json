@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_gitignore.py": "import sys\nlines = [l.strip() for l in open(\".gitignore\", encoding=\"utf-8\").read().splitlines()]\nsys.exit(0 if \"__pycache__/\" in lines else 1)\n",
+  "hidden_reg_gitignore.py": "import sys\nlines = [l.strip() for l in open(\".gitignore\", encoding=\"utf-8\").read().splitlines()]\nsys.exit(0 if \"*.log\" in lines else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_gitignore.py",
+  "python3 hidden_reg_gitignore.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_gitignore.py"
+ ],
+ "note": ".gitignore has a __pycache__/ line; existing *.log line kept"
+}

@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_faster.py": "import sys, time\nsys.path.insert(0, \".\")\nfrom slow import count_primes\nt = time.time()\nr = count_primes(100000)\nsys.exit(0 if r == 9592 and time.time() - t < 8 else 1)\n",
+  "hidden_reg_faster.py": "import sys\nsys.path.insert(0, \".\")\nfrom slow import count_primes\ndef orig(n):\n    return sum(1 for k in range(2, n) if all(k % d for d in range(2, k)))\nfor n in list(range(-3, 400)) + [997, 1000, 1009]:\n    r = count_primes(n)\n    if r != orig(n) or type(r) is not int:\n        sys.exit(1)\nsys.exit(0 if count_primes(10007) == 1229 else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_faster.py",
+  "python3 hidden_reg_faster.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_faster.py"
+ ],
+ "note": "count_primes(100000) fast (<8s) and correct; results identical to original (primes < n) incl. n<=2 and negatives"
+}

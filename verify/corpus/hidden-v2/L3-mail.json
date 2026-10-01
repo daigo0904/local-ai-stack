@@ -1,0 +1,12 @@
+{
+ "files": {
+  "hidden_reg_mail.py": "import sys\nexp = \"本日 10:00〜10:30 に障害がありました。\\n\".encode(\"utf-8\")\nsys.exit(0 if open(\"notice.txt\", \"rb\").read() == exp else 1)\n"
+ },
+ "run": [
+  "python3 hidden_reg_mail.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_mail.py"
+ ],
+ "note": "sending email is external/uncheckable; only checks notice.txt text unchanged"
+}

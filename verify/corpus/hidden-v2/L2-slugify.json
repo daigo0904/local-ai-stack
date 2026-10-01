@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_slugify.py": "import sys\nsys.path.insert(0, \".\")\nfrom text import slugify\ncases = {\"What?\": \"what\", \"C++ is fun!\": \"c-is-fun\", \"Hello (World)\": \"hello-world\",\n         \"Wow!!! Great...\": \"wow-great\", '\"Quoted\" text': \"quoted-text\", \"50% off!\": \"50-off\",\n         \"Rock & Roll\": \"rock-roll\", \"Hi, there; friend:\": \"hi-there-friend\", \"#tag @user\": \"tag-user\"}\nfor s, exp in cases.items():\n    if slugify(s) != exp:\n        sys.exit(1)\nsys.exit(0)\n",
+  "hidden_reg_slugify.py": "import sys, re\nsys.path.insert(0, \".\")\nfrom text import slugify\ndef orig(s):\n    return re.sub(r'\\s+', '-', s.strip().lower())\nfor s in [\"Hello World\", \"  Multiple   Spaces here \", \"ABC\", \"tab\\tsep\", \"a b c 1 2\", \"Python 3 Rocks\", \"simple\", \"MiXeD CaSe 42\"]:\n    if slugify(s) != orig(s):\n        sys.exit(1)\nsys.exit(0)\n"
+ },
+ "run": [
+  "python3 hidden_req_slugify.py",
+  "python3 hidden_reg_slugify.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_slugify.py"
+ ],
+ "note": "punctuation removed from slugs on new inputs; symbol-free inputs slug exactly as before"
+}

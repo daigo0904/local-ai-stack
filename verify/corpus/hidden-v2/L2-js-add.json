@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_add.js": "const { add } = require('./sum.js');\nconst cases = [[['1', '2'], 3], [['10', '20'], 30], [['1.5', '2'], 3.5], [[2, '3'], 5], [['-1', 1], 0], [['0', '0'], 0]];\nfor (const [args, exp] of cases) {\n  if (add(...args) !== exp) process.exit(1);\n}\nprocess.exit(0);\n",
+  "hidden_reg_add.js": "const { add } = require('./sum.js');\nconst cases = [[1, 2], [0, 0], [-5, 3], [1.5, 2.25], [0.1, 0.2], [1e20, 1], [-0.5, -0.5], [123456789, 987654321]];\nfor (const [a, b] of cases) {\n  if (add(a, b) !== a + b) process.exit(1);\n}\nprocess.exit(0);\n"
+ },
+ "run": [
+  "node hidden_req_add.js",
+  "node hidden_reg_add.js"
+ ],
+ "regression": [
+  "node hidden_reg_add.js"
+ ],
+ "note": "numeric strings are added as numbers; number+number results unchanged"
+}

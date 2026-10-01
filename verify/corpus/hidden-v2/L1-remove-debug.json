@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_noprint.py": "import ast, io, sys, contextlib\nsrc = open(\"app.py\", encoding=\"utf-8\").read()\ntree = ast.parse(src)\nfor node in ast.walk(tree):\n    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == \"print\":\n        sys.exit(1)\nsys.path.insert(0, \".\")\nimport app\nbuf = io.StringIO()\nwith contextlib.redirect_stdout(buf):\n    app.total([1, 2, 3])\n    app.total([])\nsys.exit(0 if buf.getvalue() == \"\" else 1)\n",
+  "hidden_reg_total.py": "import sys, io, contextlib\nsys.path.insert(0, \".\")\nimport app\ncases = [[], [1], [1, 2, 3], [-5, 5], [0.5, 0.25], (4, 5, 6), list(range(100)), [10**20, 1]]\nwith contextlib.redirect_stdout(io.StringIO()):\n    for c in cases:\n        r = app.total(c)\n        if r != sum(c) or type(r) is not type(sum(c)):\n            sys.exit(1)\nsys.exit(0)\n"
+ },
+ "run": [
+  "python3 hidden_req_noprint.py",
+  "python3 hidden_reg_total.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_total.py"
+ ],
+ "note": "no print calls/output left in app.py; total() returns same sums as before"
+}

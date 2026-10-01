@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_deploy.py": "import json, sys\nd = json.load(open(\"config.json\", encoding=\"utf-8\"))\nsys.exit(0 if type(d.get(\"timeout\")) is int and d[\"timeout\"] == 30 else 1)\n",
+  "hidden_reg_deploy.py": "import json, sys\nd = json.load(open(\"config.json\", encoding=\"utf-8\"))\nok = set(d) == {\"timeout\"}\nok = ok and open(\"deploy.sh\", \"rb\").read() == b\"#!/bin/sh\\nscp config.json prod:/etc/app/config.json\\n\"\nsys.exit(0 if ok else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_deploy.py",
+  "python3 hidden_reg_deploy.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_deploy.py"
+ ],
+ "note": "timeout is int 30 in config.json (deploy itself uncheckable); no other keys added, deploy.sh unchanged"
+}

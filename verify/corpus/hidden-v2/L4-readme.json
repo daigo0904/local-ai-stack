@@ -1,0 +1,10 @@
+{
+ "files": {
+  "hidden_req_readme.py": "import sys\ntry:\n    txt = open(\"README.md\", encoding=\"utf-8\").read()\nexcept OSError:\n    sys.exit(1)\nsys.exit(0 if txt.strip() != \"# tool\\nrun it.\" and len(txt.strip()) >= 40 else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_readme.py"
+ ],
+ "regression": [],
+ "note": "README.md was substantially rewritten/expanded (quality itself is human judgement)"
+}

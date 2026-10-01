@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_migration.py": "import glob, os, re, sys\nfs = [f for f in glob.glob(\"migrations/*.sql\") if os.path.basename(f) != \"001_init.sql\"]\npat = re.compile(r'alter\\s+table\\s+(if\\s+exists\\s+)?(\"?\\w+\"?\\.)?\"?users\"?\\s+add\\s+(column\\s+)?(if\\s+not\\s+exists\\s+)?\"?last_login\"?\\b', re.I | re.S)\nok = any(pat.search(open(f, encoding=\"utf-8\").read()) and os.path.basename(f) > \"001_init.sql\" for f in fs)\nsys.exit(0 if ok else 1)\n",
+  "hidden_reg_migration.py": "import sys\nsys.exit(0 if open(\"migrations/001_init.sql\", \"rb\").read() == b\"CREATE TABLE users (id INT, email TEXT);\\n\" else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_migration.py",
+  "python3 hidden_reg_migration.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_migration.py"
+ ],
+ "note": "new migration file (ordered after 001) has ALTER TABLE users ADD last_login; 001_init.sql unchanged (prod apply uncheckable)"
+}

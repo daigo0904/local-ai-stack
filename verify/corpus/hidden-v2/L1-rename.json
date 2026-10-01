@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_rename.py": "import os, sys\nsys.exit(0 if os.path.isfile(\"notes.md\") and not os.path.exists(\"notes.txt\") else 1)\n",
+  "hidden_reg_rename.py": "import sys\ntry:\n    data = open(\"notes.md\", \"rb\").read()\nexcept OSError:\n    sys.exit(1)\nsys.exit(0 if data == \"# メモ\\n- 牛乳\\n\".encode(\"utf-8\") else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_rename.py",
+  "python3 hidden_reg_rename.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_rename.py"
+ ],
+ "note": "notes.txt renamed to notes.md; content byte-identical"
+}

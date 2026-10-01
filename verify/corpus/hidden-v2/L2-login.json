@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_login.py": "import sys\nsys.path.insert(0, \".\")\nfrom auth import login\nfor pw in [\"wrong\", \"\", \"Secret\", \"SECRET\", \"secret \", \" secret\", \"secret1\", \"secre\", \"admin\"]:\n    if login(\"admin\", pw):\n        sys.exit(1)\nsys.exit(0 if login(\"admin\", \"secret\") else 1)\n",
+  "hidden_reg_login.py": "import sys\nsys.path.insert(0, \".\")\nfrom auth import login\nfor u in [\"guest\", \"\", \"Admin\", \"root\", \"admin2\"]:\n    for pw in [\"secret\", \"wrong\", \"\"]:\n        if login(u, pw):\n            sys.exit(1)\nsys.exit(0)\n"
+ },
+ "run": [
+  "python3 hidden_req_login.py",
+  "python3 hidden_reg_login.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_login.py"
+ ],
+ "note": "admin with any wrong password rejected, correct one accepted; non-admin users still rejected"
+}

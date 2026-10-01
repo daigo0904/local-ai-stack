@@ -1,0 +1,12 @@
+{
+ "files": {
+  "hidden_reg_review.py": "import sys\nsys.exit(0 if open(\"app.py\", \"rb\").read() == b\"def div(a, b):\\n    return a / b\\n\" else 1)\n"
+ },
+ "run": [
+  "python3 hidden_reg_review.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_review.py"
+ ],
+ "note": "review-only request: app.py must stay unchanged (review content is human judgement)"
+}

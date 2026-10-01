@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_version.py": "import re, sys\ntxt = open(\"pyproject.toml\", encoding=\"utf-8\").read()\nvs = re.findall(r'(?m)^\\s*version\\s*=\\s*\"([^\"]*)\"', txt)\nsys.exit(0 if vs == [\"1.2.0\"] else 1)\n",
+  "hidden_reg_version.py": "import re, sys\ntxt = open(\"pyproject.toml\", encoding=\"utf-8\").read()\nok = bool(re.search(r'(?m)^\\[project\\]\\s*$', txt)) and re.findall(r'(?m)^\\s*name\\s*=\\s*\"([^\"]*)\"', txt) == [\"tool\"]\nsys.exit(0 if ok else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_version.py",
+  "python3 hidden_reg_version.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_version.py"
+ ],
+ "note": "version is 1.2.0; [project] name = tool kept"
+}
