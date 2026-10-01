@@ -4,13 +4,14 @@ install — この一式を Mac に入れる。
 
     ./install            全部入れる
     ./install --check    何が入っているか見る
-    ./install guards     一部だけ入れる（guards / openclaw / tools / qwc）
+    ./install guards     一部だけ入れる（guards / openclaw / tools / qwc / verify）
 
 入るもの:
   qwc       ~/コーディングCLI に置いて ~/bin/qwc から呼べるようにする
   guards    見張り4つ＋claw を ~/bin に置き、launchd に登録する
   openclaw  設定のひな形を ~/.openclaw に置く（鍵は自分で埋める）
   tools     日々の道具22本を ~/bin に置く
+  verify    proofcheck（申告を実行の証拠と突き合わせる）を ~/bin に置く
 
 先に入れておくもの:
   - ollama（頭脳）        brew install ollama && ollama pull gemma4:26b
@@ -27,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
 BIN = os.path.join(HOME, "bin")
 
-PARTS = ["qwc", "guards", "openclaw", "tools"]
+PARTS = ["qwc", "guards", "openclaw", "tools", "verify"]
 
 
 def run_child(part):
@@ -57,6 +58,15 @@ def install_tools():
         os.chmod(dst, 0o755)
         n += 1
     print(f"  {n} 本を {BIN} に置いた")
+
+
+def install_verify():
+    print("\n── verify ──")
+    os.makedirs(BIN, exist_ok=True)
+    dst = os.path.join(BIN, "proofcheck")
+    shutil.copy2(os.path.join(HERE, "verify", "proofcheck"), dst)
+    os.chmod(dst, 0o755)
+    print(f"  置いた  {dst}")
 
 
 def install_qwc():
@@ -89,6 +99,7 @@ def check():
     n = len([f for f in os.listdir(os.path.join(HERE, "tools"))
              if os.path.exists(os.path.join(BIN, f))])
     print(f"  {'●' if n else '○'} tools（{n} 本）")
+    print(f"  {'●' if os.path.exists(os.path.join(BIN,'proofcheck')) else '○'} proofcheck")
     print("\n  中身まで見るなら: claw status")
 
 
@@ -103,6 +114,8 @@ if __name__ == "__main__":
             install_tools()
         elif part == "qwc":
             install_qwc()
+        elif part == "verify":
+            install_verify()
         else:
             run_child(part)
     print()

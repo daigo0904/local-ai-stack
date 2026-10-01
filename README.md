@@ -21,6 +21,7 @@ Mac 1台の中だけで動く AI の生活基盤。**外のAPIに一度も出ず
 | [`openclaw/`](openclaw) | LINE・Discord から話せるようにする設定一式 |
 | [`guards/`](guards) | 全体が「落ちずに黙る」のを見つけて直す層。見張り4つが互いを見る |
 | [`tools/`](tools) | 日々の道具22本（声・SNS・調べもの・片付け・見張られる側） |
+| [`verify/`](verify) | エージェントの「できました」を実行の証拠と突き合わせ、PROVEN / DISPROVEN / UNVERIFIED で判定する |
 
 外のサービスは Discord / LINE / 天気 / 検索の窓口だけ。**考えるところは全部この Mac の中**にある。
 
