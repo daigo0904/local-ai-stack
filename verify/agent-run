@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+agent-run — エージェントに仕事を頼み、走った記録を残し、契約があれば判定までする。
+
+    agent-run "ログのバグを直して"                         qwc に頼む（既定）
+    agent-run --agent codex "ログのバグを直して"           Codex に頼む（ollama で動かす）
+    agent-run --contract login.json "ログインバグを修正"    封印 → 実行 → 判定
+    agent-run --project メモ "…"                           作業場所を名前で選ぶ
+    agent-run --cwd ~/work/x "…"                           作業場所をパスで選ぶ
+
+claw run でも呼べる。
+
+## 何をするか
+
+1. 作業場所を決める（~/.openclaw/qwc-projects.txt の「名前 = パス」。1行目が既定）
+2. 契約（--contract）があれば、proofcheck seal で成功の条件と作業場を封印する
+3. エージェントを走らせ、走った記録を `codex exec --json` の形で残す
+     codex … OpenAI の openai/codex のハーネス。`codex exec --oss --local-provider ollama`
+              で、外の API に出ずにこの Mac の ollama で動かす。書けるのは作業場所だけ
+              （--sandbox workspace-write）
+     qwc   … `qwc -p … --events FILE`。qwc が同じ形で記録を書く
+4. 契約があれば proofcheck judge で、記録とエージェントの最後の発言を突き合わせて判定する
+
+記録は ~/.openclaw/runs/<日時>-<エージェント>/ に置く。作業場の外なので、
+エージェントが自分の記録を書き換えることはできない（guardrun の中で走らせるなら、
+ここを書かせない場所にしておく）。
+
+終了コード: 契約ありなら proofcheck の判定（0 = PROVEN・1 = DISPROVEN・2 = UNVERIFIED）。
+契約なしなら、エージェントの終了コード。3 = 使い方の誤り。
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECTS = os.path.expanduser("~/.openclaw/qwc-projects.txt")
+RUNS = os.path.expanduser("~/.openclaw/runs")
+OPENCLAW_CONFIG = os.path.expanduser("~/.openclaw/openclaw.json")
+DEFAULT_MODEL = "gemma4:26b"
+TIMEOUT_S = 3600
+
+
+def find_bin(name, env):
+    """入れた場所（~/bin）か、このファイルの隣か、PATH から探す。試験では環境変数で差し替える。"""
+    if os.environ.get(env):
+        return os.environ[env]
+    for cand in (os.path.join(HERE, name), os.path.expanduser(f"~/bin/{name}")):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return shutil.which(name)
+
+
+def load_projects():
+    items = []
+    try:
+        for line in open(PROJECTS):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, path = line.split("=", 1)
+            items.append((name.strip(), os.path.expanduser(path.strip())))
+    except OSError:
+        pass
+    return items
+
+
+def current_model():
+    """OpenClaw の設定にある「今使うモデル」。claw と同じものを使う。"""
+    try:
+        with open(OPENCLAW_CONFIG) as f:
+            name = json.load(f)["agents"]["defaults"]["model"]["primary"]
+        return name.split("/", 1)[-1]
+    except Exception:
+        return DEFAULT_MODEL
+
+
+def resolve_workspace(a):
+    if a.cwd:
+        return os.path.abspath(os.path.expanduser(a.cwd))
+    projects = load_projects()
+    if a.project:
+        for name, path in projects:
+            if name == a.project:
+                return path
+        raise SystemExit(f"agent-run: 作業場所 {a.project} が {PROJECTS} に無い")
+    if projects:
+        return projects[0][1]
+    return os.getcwd()
+
+
+def agent_command(a, ws, run, model):
+    events = os.path.join(run, "events.jsonl")
+    if a.agent == "codex":
+        codex = find_bin("codex", "AGENT_RUN_CODEX")
+        if not codex:
+            raise SystemExit("agent-run: codex が見つからない（npm i -g @openai/codex）")
+        # 記録は標準出力に JSONL で出るので、そのまま events.jsonl に受ける
+        return [codex, "exec", "--oss", "--local-provider", "ollama", "-m", model,
+                "--sandbox", "workspace-write", "--skip-git-repo-check", "--json",
+                "-C", ws, "-o", os.path.join(run, "last-message.txt"), a.task], events, True
+    qwc = find_bin("qwc", "AGENT_RUN_QWC")
+    if not qwc:
+        raise SystemExit("agent-run: qwc が見つからない（./install qwc）")
+    # -p は確認に答えられないので --yolo。そのぶん、判定は契約と proofcheck に任せる
+    return [qwc, "-p", a.task, "--cwd", ws, "--yolo", "--quiet-thinking", "-m", model,
+            "--events", events], events, False
+
+
+def summarize(events_path):
+    cmds, last, failed = [], "", False
+    try:
+        for row in open(events_path):
+            try:
+                ev = json.loads(row)
+            except ValueError:
+                continue
+            if ev.get("type") in ("turn.failed", "error"):
+                failed = True
+            it = ev.get("item") or {}
+            if ev.get("type") == "item.completed" and it.get("type") == "command_execution":
+                cmds.append(it)
+            if ev.get("type") == "item.completed" and it.get("type") == "agent_message":
+                last = it.get("text", "")
+    except OSError:
+        return "走った記録がない"
+    bad = [c for c in cmds if c.get("exit_code") not in (0, None) or c.get("status") == "failed"]
+    lines = [f"走らせた命令 {len(cmds)} 本（0 以外で終わったもの {len(bad)} 本）"
+             + ("・途中で失敗した" if failed else "")]
+    for c in bad[-3:]:
+        lines.append(f"  落ちた: {c.get('command')} → 終了コード {c.get('exit_code')}")
+    if last:
+        lines.append(f"最後の発言: {last.strip()[:300]}")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="agent-run", description="エージェントに頼み、記録を残し、判定する")
+    p.add_argument("task")
+    p.add_argument("--agent", choices=["qwc", "codex"], default="qwc")
+    p.add_argument("--contract", help="成功の条件（verify/README.md の契約）。あれば判定まで行う")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--project", help="~/.openclaw/qwc-projects.txt の名前")
+    g.add_argument("--cwd", help="作業場所のパス")
+    p.add_argument("--model", help="使うモデル（既定: OpenClaw の設定と同じ）")
+    p.add_argument("--timeout", type=int, default=TIMEOUT_S)
+    a = p.parse_args(argv)
+
+    ws = resolve_workspace(a)
+    if not os.path.isdir(ws):
+        print(f"agent-run: 作業場所が無い: {ws}", file=sys.stderr)
+        return 3
+    model = a.model or current_model()
+    run = os.path.join(RUNS, f"{datetime.now():%Y%m%d-%H%M%S}-{a.agent}")
+    os.makedirs(run, exist_ok=True)
+    with open(os.path.join(run, "task.json"), "w") as f:
+        json.dump({"task": a.task, "agent": a.agent, "model": model, "workspace": ws,
+                   "contract": a.contract}, f, ensure_ascii=False, indent=1)
+
+    proofcheck = find_bin("proofcheck", "AGENT_RUN_PROOFCHECK")
+    seal_id = None
+    if a.contract:
+        if not proofcheck:
+            print("agent-run: proofcheck が見つからない（./install verify）", file=sys.stderr)
+            return 3
+        s = subprocess.run([proofcheck, "seal", a.contract, "--workspace", ws,
+                            "--run", os.path.join(run, "proof")], capture_output=True, text=True)
+        if s.returncode != 0:
+            print(s.stderr.strip() or s.stdout.strip(), file=sys.stderr)
+            return 3
+        seal_id = next((l.split()[-1] for l in s.stdout.splitlines() if l.startswith("封印ID")), None)
+
+    cmd, events, events_on_stdout = agent_command(a, ws, run, model)
+    print(f"{a.agent} に頼んだ（{model}・{ws}）")
+    print(f"記録: {run}")
+    try:
+        if events_on_stdout:
+            with open(events, "w") as out, open(os.path.join(run, "agent.log"), "w") as err:
+                r = subprocess.run(cmd, cwd=ws, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                   timeout=a.timeout)
+        else:
+            with open(os.path.join(run, "agent.log"), "w") as log:
+                r = subprocess.run(cmd, cwd=ws, stdout=log, stderr=subprocess.STDOUT,
+                                   stdin=subprocess.DEVNULL, timeout=a.timeout)
+        agent_exit = r.returncode
+    except subprocess.TimeoutExpired:
+        agent_exit = None
+        print(f"時間切れ（{a.timeout} 秒）で止めた")
+
+    print(summarize(events))
+    if not a.contract:
+        print("契約が無いので判定はしない（--contract で成功の条件を渡すと判定まで行う）")
+        return agent_exit if agent_exit is not None else 1
+
+    print()
+    j = [proofcheck, "judge", os.path.join(run, "proof"), "--codex-jsonl", events]
+    if seal_id:
+        j += ["--seal-id", seal_id]
+    return subprocess.run(j).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

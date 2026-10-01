@@ -222,6 +222,91 @@ class TestUnverified(Case):
         self.assertEqual(self.verdicts(r, "contract")["outside"], pc.DISPROVEN)
 
 
+class TestCodexEvents(Case):
+    """codex exec --json（qwc --events も同じ形）の記録を証拠として読む。"""
+
+    def events(self, *items, failed=False):
+        rows = [{"type": "thread.started", "thread_id": "t"}, {"type": "turn.started"}]
+        rows += [{"type": "item.completed", "item": dict(id=f"item_{i}", **it)} for i, it in enumerate(items)]
+        rows.append({"type": "turn.failed", "error": {"message": "x"}} if failed
+                    else {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
+        path = os.path.join(self.tmp.name, "events.jsonl")
+        with open(path, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        return path
+
+    def judge_events(self, path, claim=None):
+        args = ["judge", self.run_dir, "--codex-jsonl", path, "--json"]
+        if claim:
+            args += ["--claim", claim]
+        code, out = self.cli(*args)
+        return code, json.loads(out)
+
+    def test_claim_comes_from_last_agent_message(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        ev = self.events(
+            {"type": "command_execution", "command": "bash -lc 'python3 test_login.py'",
+             "aggregated_output": "", "exit_code": 0, "status": "completed"},
+            {"type": "file_change", "changes": [{"path": "auth.py", "kind": "update"}], "status": "completed"},
+            {"type": "agent_message", "text": "auth.py を修正し、テストを実行し、すべて通りました。"})
+        _, r = self.judge_events(ev)
+        self.assertIn("すべて通りました", r["claim_text"])
+        claims = {i["text"].split("（")[0]: i for i in r["claims"]}
+        self.assertEqual(claims["テストを実行した"]["verdict"], pc.PROVEN)
+        self.assertIn("ハーネスの記録", claims["テストを実行した"]["evidence"][0])
+        self.assertEqual(claims["テストが通った"]["verdict"], pc.PROVEN)
+        # 作業場の外は Codex の記録からは分からない
+        self.assertEqual(self.verdicts(r, "contract")["outside"], pc.UNVERIFIED)
+
+    def test_agent_saw_red_but_said_green(self):
+        """エージェント自身の最後のテスト実行は落ちていたのに「通りました」。"""
+        self.seal()
+        ev = self.events(
+            {"type": "command_execution", "command": f"{PY} test_login.py",
+             "aggregated_output": "", "exit_code": 1, "status": "failed"},
+            {"type": "agent_message", "text": "テストを実行し、すべて通りました。"})
+        code, r = self.judge_events(ev)
+        self.assertEqual(code, 1)
+        passed = next(i for i in r["claims"] if i["text"].startswith("テストが通った"))
+        self.assertEqual(passed["verdict"], pc.DISPROVEN)
+        self.assertTrue(any("終了コード 1" in e for e in passed["evidence"]), passed["evidence"])
+
+    def test_no_test_command_disproves_ran(self):
+        self.seal()
+        ev = self.events(
+            {"type": "command_execution", "command": "cat auth.py", "aggregated_output": "",
+             "exit_code": 0, "status": "completed"},
+            {"type": "command_execution", "command": "pytest", "aggregated_output": "",
+             "exit_code": None, "status": "declined"})   # 断られた命令は走っていない
+        _, r = self.judge_events(ev, claim="テストを実行しました")
+        self.assertEqual(r["claims"][0]["verdict"], pc.DISPROVEN)
+
+    def test_receipt_fills_what_harness_cannot_see(self):
+        self.seal()
+        write(self.ws, "auth.py", AUTH_FIXED)
+        ev = self.events({"type": "agent_message", "text": "修正しました"})
+        rp = os.path.join(self.tmp.name, "receipt.json")
+        with open(rp, "w") as f:
+            json.dump({"outside_changes": 0}, f)
+        code, out = self.cli("judge", self.run_dir, "--codex-jsonl", ev, "--receipt", rp, "--json")
+        r = json.loads(out)
+        self.assertEqual(self.verdicts(r, "contract")["outside"], pc.PROVEN)
+
+    def test_qwc_events_file_is_readable(self):
+        """qwc --events が書く形（qwc/test/run.mjs と同じ並び）を読める。"""
+        self.seal()
+        ev = self.events(
+            {"type": "command_execution", "command": "echo half; exit 3", "aggregated_output": "half",
+             "exit_code": 3, "status": "failed"},
+            {"type": "file_change", "changes": [{"path": "fixed.txt", "kind": "add"}], "status": "completed"},
+            {"type": "agent_message", "text": "テストを実行し、すべて通りました。"})
+        h = pc.load_codex_events(ev)
+        self.assertEqual(h["processes"], [["echo", "half;", "exit", "3"]])
+        self.assertEqual(h["agent_message"], "テストを実行し、すべて通りました。")
+
+
 class TestSealing(Case):
     def test_seal_id_mismatch_refuses(self):
         self.seal()

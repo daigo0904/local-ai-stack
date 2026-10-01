@@ -11,7 +11,7 @@ install — この一式を Mac に入れる。
   guards    見張り4つ＋claw を ~/bin に置き、launchd に登録する
   openclaw  設定のひな形を ~/.openclaw に置く（鍵は自分で埋める）
   tools     日々の道具22本を ~/bin に置く
-  verify    proofcheck（申告を実行の証拠と突き合わせる）を ~/bin に置く
+  verify    proofcheck（申告を実行の証拠と突き合わせる）と agent-run を ~/bin に置く
 
 先に入れておくもの:
   - ollama（頭脳）        brew install ollama && ollama pull gemma4:26b
@@ -63,10 +63,11 @@ def install_tools():
 def install_verify():
     print("\n── verify ──")
     os.makedirs(BIN, exist_ok=True)
-    dst = os.path.join(BIN, "proofcheck")
-    shutil.copy2(os.path.join(HERE, "verify", "proofcheck"), dst)
-    os.chmod(dst, 0o755)
-    print(f"  置いた  {dst}")
+    for name in ("proofcheck", "agent-run"):
+        dst = os.path.join(BIN, name)
+        shutil.copy2(os.path.join(HERE, "verify", name), dst)
+        os.chmod(dst, 0o755)
+        print(f"  置いた  {dst}")
 
 
 def install_qwc():
