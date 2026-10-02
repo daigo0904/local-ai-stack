@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_port.py": "import json, sys\nd = json.load(open(\"config.json\", encoding=\"utf-8\"))\nsys.exit(0 if type(d.get(\"port\")) is int and d[\"port\"] == 8080 else 1)\n",
+  "hidden_reg_port.py": "import json, sys\nd = json.load(open(\"config.json\", encoding=\"utf-8\"))\nok = d.get(\"host\") == \"localhost\" and set(d) == {\"port\", \"host\"}\nsys.exit(0 if ok else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_port.py",
+  "python3 hidden_reg_port.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_port.py"
+ ],
+ "note": "port is integer 8080; host unchanged and no keys added/removed"
+}

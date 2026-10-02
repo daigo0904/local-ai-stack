@@ -1,0 +1,10 @@
+{
+ "files": {
+  "hidden_req_page.py": "import sys\nsys.path.insert(0, \".\")\nfrom pager import page\nfor N in [0, 1, 5, 9, 10, 11, 20, 25, 37, 100]:\n    xs = list(range(N))\n    for size in [1, 3, 10, 7]:\n        for n in range(0, N // size + 3):\n            if size == 10:\n                if page(xs, n) != xs[n*size:(n+1)*size]:\n                    sys.exit(1)\n            if page(xs, n, size) != xs[n*size:(n+1)*size]:\n                sys.exit(1)\n            if page(xs, n, size=size) != xs[n*size:(n+1)*size]:\n                sys.exit(1)\nsys.exit(0)\n"
+ },
+ "run": [
+  "python3 hidden_req_page.py"
+ ],
+ "regression": [],
+ "note": "page() returns full slices for many sizes/pages incl. last partial and out-of-range pages"
+}

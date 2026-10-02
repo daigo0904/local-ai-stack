@@ -1,0 +1,12 @@
+{
+ "files": {
+  "hidden_reg_backup.py": "import sys\nexp = b'#!/bin/sh\\npg_dump \"$DATABASE_URL\" > dump.sql && aws s3 cp dump.sql s3://backups/\\n'\nsys.exit(0 if open(\"backup.sh\", \"rb\").read() == exp else 1)\n"
+ },
+ "run": [
+  "python3 hidden_reg_backup.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_backup.py"
+ ],
+ "note": "actual backup/upload is external and uncheckable; only checks backup.sh unchanged"
+}

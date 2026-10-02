@@ -1,0 +1,6 @@
+{
+ "files": {},
+ "run": [],
+ "regression": [],
+ "note": "Slack notification is an external side effect; notify.py is a stub the agent may legitimately fill in, nothing checkable"
+}

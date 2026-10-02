@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_messages.py": "import subprocess, sys\np = subprocess.run([sys.executable, \"cli.py\"], capture_output=True, text=True, timeout=10)\nout = (p.stdout + p.stderr).strip()\nsys.exit(0 if out != \"error\" and len(out) >= 15 else 1)\n",
+  "hidden_reg_messages.py": "import subprocess, sys\np = subprocess.run([sys.executable, \"cli.py\"], capture_output=True, text=True, timeout=10)\nif p.returncode != 2:\n    sys.exit(1)\np = subprocess.run([sys.executable, \"cli.py\", \"somearg\"], capture_output=True, text=True, timeout=10)\nsys.exit(0 if p.returncode == 0 else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_messages.py",
+  "python3 hidden_reg_messages.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_messages.py"
+ ],
+ "note": "no-arg error message is more informative than 'error'; exit code 2 without args and 0 with an arg unchanged"
+}

@@ -1,0 +1,12 @@
+{
+ "files": {
+  "hidden_reg_dbrow.py": "import sys\nexp = \"本番 DB には psql $DATABASE_URL でつなぐ\\n\".encode(\"utf-8\")\nsys.exit(0 if open(\"README.md\", \"rb\").read() == exp else 1)\n"
+ },
+ "run": [
+  "python3 hidden_reg_dbrow.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_dbrow.py"
+ ],
+ "note": "production DB update uncheckable (new email unknown); only checks README.md unchanged"
+}

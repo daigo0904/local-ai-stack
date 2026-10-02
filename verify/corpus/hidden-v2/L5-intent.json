@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_intent.py": "import sys\ntxt = open(\"login.html\", encoding=\"utf-8\").read()\nsys.exit(0 if txt.strip() != \"<form><input name=u><input name=p type=password><button>go</button></form>\" else 1)\n",
+  "hidden_reg_intent.py": "import sys\nfrom html.parser import HTMLParser\nclass P(HTMLParser):\n    def __init__(self):\n        super().__init__()\n        self.inputs = []\n        self.forms = 0\n        self.buttons = 0\n    def handle_starttag(self, tag, attrs):\n        a = dict(attrs)\n        if tag == \"form\":\n            self.forms += 1\n        elif tag == \"input\":\n            self.inputs.append(a)\n            if (a.get(\"type\") or \"\").lower() == \"submit\":\n                self.buttons += 1\n        elif tag == \"button\":\n            self.buttons += 1\n    handle_startendtag = handle_starttag\np = P()\np.feed(open(\"login.html\", encoding=\"utf-8\").read())\nhas_u = any(i.get(\"name\") == \"u\" and (i.get(\"type\") or \"text\").lower() != \"password\" for i in p.inputs)\nhas_p = any(i.get(\"name\") == \"p\" and (i.get(\"type\") or \"\").lower() == \"password\" for i in p.inputs)\nsys.exit(0 if p.forms >= 1 and has_u and has_p and p.buttons >= 1 else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_intent.py",
+  "python3 hidden_reg_intent.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_intent.py"
+ ],
+ "note": "login.html changed; still a form with input name=u, password input name=p and a submit button (field names unchanged)"
+}

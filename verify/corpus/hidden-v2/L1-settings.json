@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_settings.py": "import re, sys\ntry:\n    txt = open(\"settings.yaml\", encoding=\"utf-8\").read()\nexcept OSError:\n    sys.exit(1)\nok = any(re.fullmatch(r\"debug\\s*:\\s*(false|False|FALSE)\\s*(#.*)?\", l.rstrip()) for l in txt.splitlines())\nsys.exit(0 if ok else 1)\n",
+  "hidden_reg_settings.py": "import sys\nsys.exit(0 if open(\"app.py\", \"rb\").read() == b\"print('app')\\n\" else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_settings.py",
+  "python3 hidden_reg_settings.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_settings.py"
+ ],
+ "note": "settings.yaml has top-level debug: false; app.py untouched"
+}

@@ -22,12 +22,15 @@ def load_solutions(path):
     return json.load(open(path))
 
 
+HIDDEN_DIR = os.path.join(rc.TASKS, "..", "hidden")
+
+
 def hidden_for(tid):
-    p = os.path.join(rc.TASKS, "..", "hidden", f"{tid}.json")
+    p = os.path.join(HIDDEN_DIR, f"{tid}.json")
     if not os.path.exists(p):
         return None
     h = json.load(open(p))
-    return {k: h[k] for k in ("files", "run")} if h.get("run") else None
+    return {k: h[k] for k in ("files", "run", "regression") if k in h} if h.get("run") else None
 
 
 def judge(task, contract, sol):
@@ -59,7 +62,14 @@ def main(argv=None):
     p.add_argument("--solutions", required=True)
     p.add_argument("--set", required=True, help="組の名前（A・C など）")
     p.add_argument("--no-save", action="store_true")
+    p.add_argument("--hidden-dir", help="隠しテストの置き場（既定: corpus/hidden）")
+    p.add_argument("--proofcheck", help="判定に使う proofcheck（版を比べるとき。既定: このブランチのもの）")
     a = p.parse_args(argv)
+    global HIDDEN_DIR
+    if a.hidden_dir:
+        HIDDEN_DIR = a.hidden_dir
+    if a.proofcheck:
+        rc.PROOFCHECK = os.path.abspath(a.proofcheck)
     tasks = {t["id"]: t for t in rc.load_tasks()}
     sols = load_solutions(a.solutions)
     rows = []

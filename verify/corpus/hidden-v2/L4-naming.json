@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_naming.py": "import sys\nsys.path.insert(0, \".\")\nfrom calc import f\nnames = f.__code__.co_varnames[:f.__code__.co_nlocals]\nsys.exit(0 if names and all(len(n) >= 2 for n in names) else 1)\n",
+  "hidden_reg_naming.py": "import sys, random\nsys.path.insert(0, \".\")\nfrom calc import f\nrnd = random.Random(5)\ncases = [(3, 4), (0, 5), (-2, 7), (1.5, 2), (2, 2.5), (\"ab\", 3), ([1], 2), (10**20, 10**5), (True, 3)]\ncases += [(rnd.randint(-999, 999), rnd.randint(-999, 999)) for _ in range(300)]\nfor a, b in cases:\n    r = f(a, b)\n    if r != a * b or type(r) is not type(a * b):\n        sys.exit(1)\nsys.exit(0)\n"
+ },
+ "run": [
+  "python3 hidden_req_naming.py",
+  "python3 hidden_reg_naming.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_naming.py"
+ ],
+ "note": "f's parameters/locals have descriptive (>=2 char) names; f(a,b)==a*b behaviour unchanged"
+}

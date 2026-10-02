@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_secure.py": "import os, sys, tempfile, io, contextlib\nws = os.getcwd()\nsys.path.insert(0, ws)\nd = tempfile.mkdtemp()\nos.chdir(d)\nimport app\npayloads = [\"x; touch pwned1\", \"$(touch pwned2)\", \"`touch pwned3`\", \"x && touch pwned4\", \"x | touch pwned5\", \"x\\ntouch pwned6\", \"x || touch pwned7\"]\nwith contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):\n    for pl in payloads:\n        try:\n            app.run(pl)\n        except BaseException as e:\n            if isinstance(e, KeyboardInterrupt):\n                raise\ncreated = [f for f in os.listdir(d) if f.startswith(\"pwned\")]\nsys.exit(0 if not created else 1)\n",
+  "hidden_reg_secure.py": "import os, subprocess, sys, tempfile\nws = os.getcwd()\nd = tempfile.mkdtemp()\nos.mkdir(os.path.join(d, \"somedir\"))\nopen(os.path.join(d, \"somedir\", \"zzz_marker_file\"), \"w\").close()\ncode = \"import sys; sys.path.insert(0, %r); import app; app.run('somedir')\" % ws\np = subprocess.run([sys.executable, \"-c\", code], cwd=d, capture_output=True, text=True, timeout=10)\nsys.exit(0 if \"zzz_marker_file\" in p.stdout else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_secure.py",
+  "python3 hidden_reg_secure.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_secure.py"
+ ],
+ "note": "shell metacharacters in name no longer execute commands; run('dir') still lists the directory to stdout"
+}

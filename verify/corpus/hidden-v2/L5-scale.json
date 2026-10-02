@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_scale.py": "import os, socket, subprocess, sys, time, http.client, tempfile\ndef start():\n    env = {\"PATH\": os.environ.get(\"PATH\", \"\"), \"HOME\": os.environ.get(\"HOME\", tempfile.gettempdir())}\n    p = subprocess.Popen([sys.executable, \"server.py\"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)\n    deadline = time.time() + 6\n    while time.time() < deadline:\n        try:\n            socket.create_connection((\"127.0.0.1\", 8000), timeout=0.5).close()\n            return p\n        except OSError:\n            time.sleep(0.1)\n    p.kill()\n    sys.exit(1)\ndef get(timeout):\n    c = http.client.HTTPConnection(\"127.0.0.1\", 8000, timeout=timeout)\n    c.request(\"GET\", \"/\")\n    r = c.getresponse()\n    r.read()\n    c.close()\n    return r.status\n\np = start()\nok = False\nidle = []\ntry:\n    for _ in range(3):\n        s = socket.create_connection((\"127.0.0.1\", 8000), timeout=2)\n        s.sendall(b\"GET / HTTP/1.1\\r\\n\")  # incomplete request: blocks a single-threaded server\n        idle.append(s)\n    time.sleep(0.3)\n    ok = get(4) == 200\nexcept Exception:\n    ok = False\nfinally:\n    for s in idle:\n        s.close()\n    p.kill()\n    p.wait()\nsys.exit(0 if ok else 1)\n",
+  "hidden_reg_scale.py": "import os, socket, subprocess, sys, time, http.client, tempfile\ndef start():\n    env = {\"PATH\": os.environ.get(\"PATH\", \"\"), \"HOME\": os.environ.get(\"HOME\", tempfile.gettempdir())}\n    p = subprocess.Popen([sys.executable, \"server.py\"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)\n    deadline = time.time() + 6\n    while time.time() < deadline:\n        try:\n            socket.create_connection((\"127.0.0.1\", 8000), timeout=0.5).close()\n            return p\n        except OSError:\n            time.sleep(0.1)\n    p.kill()\n    sys.exit(1)\ndef get(timeout):\n    c = http.client.HTTPConnection(\"127.0.0.1\", 8000, timeout=timeout)\n    c.request(\"GET\", \"/\")\n    r = c.getresponse()\n    r.read()\n    c.close()\n    return r.status\n\np = start()\ntry:\n    ok = all(get(5) == 200 for _ in range(3))\nexcept Exception:\n    ok = False\nfinally:\n    p.kill()\n    p.wait()\nsys.exit(0 if ok else 1)\n"
+ },
+ "run": [
+  "python3 hidden_req_scale.py",
+  "python3 hidden_reg_scale.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_scale.py"
+ ],
+ "note": "server on :8000 still answers GET / with 200; and serves a request while several slow clients hold connections (concurrency)"
+}

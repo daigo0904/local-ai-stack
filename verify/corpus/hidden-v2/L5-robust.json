@@ -1,0 +1,12 @@
+{
+ "files": {
+  "hidden_reg_robust.py": "import sys\nsys.path.insert(0, \".\")\nfrom parser import parse\nfor line, exp in [(\"key=value\", (\"key\", \"value\")), (\"a=1\", (\"a\", \"1\")), (\"PATH=/usr/bin\", (\"PATH\", \"/usr/bin\")),\n                  (\"x_y=hello world\", (\"x_y\", \"hello world\")), (\"name=alice\", (\"name\", \"alice\"))]:\n    r = parse(line)\n    if tuple(r) != exp or len(r) != 2 or not all(type(v) is str for v in r):\n        sys.exit(1)\nsys.exit(0)\n"
+ },
+ "run": [
+  "python3 hidden_reg_robust.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_robust.py"
+ ],
+ "note": "robustness for bad input is open-ended; checks well-formed key=value lines still parse to the same (str, str) pair"
+}

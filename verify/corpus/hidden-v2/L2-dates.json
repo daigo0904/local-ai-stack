@@ -1,0 +1,14 @@
+{
+ "files": {
+  "hidden_req_dates.py": "import sys\nsys.path.insert(0, \".\")\nfrom dates import parse_date\ncases = {\"2024-1-5\": (2024, 1, 5), \"1999-9-9\": (1999, 9, 9), \"2024-12-5\": (2024, 12, 5),\n         \"2024-1-15\": (2024, 1, 15), \"2023-2-28\": (2023, 2, 28), \"2000-01-7\": (2000, 1, 7), \"2000-7-01\": (2000, 7, 1)}\nfor s, exp in cases.items():\n    r = parse_date(s)\n    if r != exp or not isinstance(r, tuple) or not all(type(x) is int for x in r):\n        sys.exit(1)\nsys.exit(0)\n",
+  "hidden_reg_dates.py": "import sys\nsys.path.insert(0, \".\")\nfrom dates import parse_date\nfor s, exp in {\"2024-01-05\": (2024, 1, 5), \"1999-12-31\": (1999, 12, 31), \"2000-02-29\": (2000, 2, 29),\n               \"2023-10-10\": (2023, 10, 10), \"1970-01-01\": (1970, 1, 1)}.items():\n    r = parse_date(s)\n    if r != exp or not isinstance(r, tuple) or not all(type(x) is int for x in r):\n        sys.exit(1)\nfor bad in [\"\", \"abc\", \"2024/01/05\", \"2024-01\", \"2024-01-05x\", \"x2024-01-05\", \"20240105\"]:\n    try:\n        parse_date(bad)\n    except ValueError:\n        continue\n    sys.exit(1)\nsys.exit(0)\n"
+ },
+ "run": [
+  "python3 hidden_req_dates.py",
+  "python3 hidden_reg_dates.py"
+ ],
+ "regression": [
+  "python3 hidden_reg_dates.py"
+ ],
+ "note": "non-padded dates parse to int tuples; padded dates and ValueError on malformed input unchanged"
+}
