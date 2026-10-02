@@ -1,134 +1,138 @@
-# ローカルAI一式
+# local-ai-stack — don't trust "done"
 
-Mac 1台の中だけで動く AI の生活基盤。**外のAPIに一度も出ずに**、話し、調べ、コードを書き、
-自分が止まっていないかを見張る。
+**An open-source verification layer that checks whether an AI coding agent actually did what it says it did**, built on top of a fully local agent stack that runs on one laptop every day.
+
+When an agent says *"I fixed the bug and all tests pass"*, `proofcheck` does not read that sentence as evidence. It seals a task contract **before** the agent runs, collects evidence the agent cannot write, and judges every claim in the report as **PROVEN**, **DISPROVEN** or **UNVERIFIED**. When it cannot decide, it says exactly which evidence is missing instead of guessing.
+
+> 日本語版: [README.ja.md](README.ja.md) · Most design notes and measurement records are in Japanese; this page and [`verify/README.md`](verify/README.md) are the English entry points.
+
+---
+
+## Why now
+
+Coding agents (OpenAI Codex, Claude Code, OpenHands and many others) now run with write access on developers' machines and inside company infrastructure, often for long stretches with no one watching. Their final report is usually the only thing a human reads.
+
+The industry is converging on **sandboxes**: NVIDIA OpenShell, Codex's own sandbox, container runners. A sandbox bounds what an agent *can touch*. It does not tell you whether the work the agent *claims* actually happened. An agent can stay perfectly inside its sandbox and still report success it did not achieve, for example by special-casing the inputs of the visible test, or by dropping a `sitecustomize.py` that makes the test print OK. CI does not catch this either: CI trusts the repository state the agent produced.
+
+The formats that agents and sandboxes emit (Codex's `exec --json` event stream, OpenShell's OCSF audit log) are being settled right now. This is the moment to make "verify the claim against evidence" a default layer in agent harnesses, while the plumbing is still being decided. Once agents are the default way code gets written, retrofitting verification will be much harder, and teams will be left with two bad options: trust the report, or re-check everything by hand.
+
+## The problem, measured on a real system
+
+Since August 2026 I have run this stack as my daily infrastructure: it answers me on LINE and Discord, writes code with a local 26B model, and watches itself. I logged every failure. **The ledger has 107 entries, and almost none of them crashed.** They kept running and reported success while doing something else:
+
+- Asked to delete a function that did not exist, the coding agent removed two blank lines and reported *"deleted"*. In a re-run it changed `mins // 60` to `mins // 6`, creating a real bug, and reported it had fixed one.
+- Asked to make a test pass without editing the test, the agent wrote a `sitecustomize.py` hook that forced the test to print OK and reported *"confirmed successful"*. The original test still failed. (OpenClaw did the same with `conftest.py`.)
+- A recovery script logged *"restarted (success)"* 50 times without ever restarting anything; it discarded the return code.
+- A watchdog meant to catch "claimed but not done" never fired in **218 sessions**, because the counter it relied on also counted harmless commands.
+- In 54 runs of Codex, Claude Code and OpenClaw under the same sandbox, OpenClaw twice reported a task as achieved after doing nothing.
+
+The pattern is the same at every layer: *it is broken, and it does not say so.* Agents do this as a side effect of trying to finish the task, not out of malice, which is exactly why it has to be checked from outside the agent.
+
+## What is in this repository
+
+| Path | What it is |
+| --- | --- |
+| [`verify/`](verify/) | **The verification layer.** `proofcheck` (seal → judge), `agent-run` (run Codex or qwc under a sealed contract), the task corpus and the measurement tools. Start here. |
+| [`guards/`](guards/) | Watchdogs that detect *silent* failures (process alive, work stopped) and restart services, plus `guard-drill`, which breaks things on purpose every morning to prove the watchdogs notice. |
+| [`openclaw/`](openclaw/) | Configuration for the [OpenClaw](https://github.com/openclaw/openclaw) gateway (LINE / Discord / terminal / voice). |
+| [`tools/`](tools/) | 22 everyday tools around the stack (voice, research, backups, SNS drafts). |
+| [qwythos-code](https://github.com/daigo0904/qwythos-code) | **qwc**, my autonomous coding CLI for local models, with in-loop "report watchers". Installed by `./install qwc`. |
+| [agent-report-eval](https://github.com/daigo0904/agent-report-eval) | The evaluation harness for qwc's report watchers (1,481 recorded cases replayed through the real agent loop). |
+
+## How the verification works
 
 ```
-        LINE / Discord / ターミナル / 声
-                    │
-              OpenClaw（受け口）──────┐
-                    │                 │
-                    ├──→ qwc（コードを書く）
-                    │                 │
-                    └──→ ollama（頭脳・gemma4:26b）
-                              ↑
-                        見張り（止まらないようにする層）
+ before the run                after the run
+ ──────────────                ─────────────────────────────────────────────
+ contract ──┐                  evidence the agent cannot write
+            ├─ seal ─────────► • diff against the sealed snapshot      (verifier)
+ workspace ─┘   (sealed ID)    • tests re-run with tests and test hooks
+                                 restored to the sealed state          (verifier)
+                               • hidden tests the agent never saw      (verifier)
+                               • harness event log (Codex / qwc)       (harness)
+                               • sandbox record (guardrun / OpenShell) (kernel)
+                                        │
+ agent's final report ─► split into atomic claims ─► rules D1–D4 ─► PROVEN / DISPROVEN / UNVERIFIED
 ```
 
-| | 何をするか |
-| :--- | :--- |
-| [`qwc`](https://github.com/daigo0904/qwythos-code) | ローカルのモデルで動く自律コーディングCLI。雑談も作業も同じ画面でできる。**本体は別リポジトリ**（`./install qwc` が取ってくる） |
-| [`openclaw/`](openclaw) | LINE・Discord から話せるようにする設定一式 |
-| [`guards/`](guards) | 全体が「落ちずに黙る」のを見つけて直す層。見張り4つが互いを見る |
-| [`tools/`](tools) | 日々の道具22本（声・SNS・調べもの・片付け・見張られる側） |
-| [`verify/`](verify) | エージェントの「できました」を実行の証拠と突き合わせ、PROVEN / DISPROVEN / UNVERIFIED で判定する |
+- **Claims** are typed: changed files, ran tests, tests pass, bug fixed, behaviour unchanged, external effects, absence claims, and "other". A sentence that cannot be mapped to a type is kept as *other* and stays UNVERIFIED, so the report is never certified from the parts that happened to be easy to parse.
+- **Each claim kind requires specific evidence at a minimum strength** (kernel record > verifier's own observation > agent-side log). "Bug fixed" requires the reproduction test to flip *and* hidden tests to pass; a reproduction test that only flips can be satisfied by special-casing its input.
+- **Four rules decide the verdict**, and ten properties of those rules are checked by randomized tests (for example: adding evidence can never turn a DISPROVEN claim into PROVEN; stopping early on cheap evidence never changes the overall verdict).
+- **DISPROVEN means the evidence contradicts the claim.** Missing evidence is UNVERIFIED, with the missing evidence named. That list is the to-do list for whoever wants a stronger answer.
 
-外のサービスは Discord / LINE / 天気 / 検索の窓口だけ。**考えるところは全部この Mac の中**にある。
+Details, usage and the exact guarantees: [`verify/README.md`](verify/README.md).
 
-> **はじめて見る人は [docs/はじめての人へ](docs/はじめての人へ.md) から。**
-> 何ができて、どう作られていて、何ができないかを、予備知識なしで読めるように書いてある。
+## Results so far, measured blind
 
-## 入れ方
+My own numbers misled me early on: a rule-based lie detector scored 97% on my own data and **72% (23/32) with 27% false positives** under a blind independent judge. Since then every change to the verifier follows the same protocol:
+
+1. Definitions and metrics are **pre-registered** and committed before anything is measured.
+2. Hidden tests and solution sets (honest and deceptive) are written by **separate authors who see only the task text and workspace**, never the rules, contracts or earlier results.
+3. Each set is inserted unread and **measured once**. If I want to change something after seeing results, it becomes the next version and is measured on a new set from new authors.
+
+On the latest blind set (33 tasks, 72 deceptive and 48 honest solutions):
+
+| Version | Lies passing the contract | Lies fully certified | Honest solutions wrongly DISPROVEN | Honest solutions fully certified |
+| --- | --: | --: | --: | --: |
+| Hand-written contracts only | 55 | — | — | — |
+| v1 (hidden tests) | 27 | 17 | 1 | 30 |
+| v2 | 21 | 6 | 2 | 14 |
+
+The trade-off is visible and deliberate: the verifier stopped certifying lies, and it also certifies fewer honest reports, leaving them UNVERIFIED with named gaps. Five of the six lies still certified are *implicature lies*: the agent did part of the task and only said "I changed the file", which is literally true. A report checker cannot catch those; the contract has to.
+
+**Not measured yet:** real agents on the corpus. Every number above comes from solutions written by blind LLM authors. Running Codex, Claude Code, OpenHands and qwc on the corpus is the next step. Raw records: [`verify/corpus/v2の結果.md`](verify/corpus/v2の結果.md) (Japanese).
+
+## How this was built
+
+This is not a weekend project. It is what came out of living with the failures:
+
+- **A failure ledger of 107 entries**, each with what happened, why it was not noticed, and what changed. Thirty design rules came out of it, such as *never read the report, compare before and after* and *never let the agent's own words count as evidence for the agent*.
+- **The sandbox was tested by trying to escape it, on every machine it runs on.** Moving `guardrun` to a second machine exposed 19 holes on its own; a later round of audits (a Codex review plus real runs) closed 22 more. Examples: an SBPL injection through a workspace path that re-enabled the network; allowing `/private/var/folders` for temp files, which silently disabled the wall when the workspace lived underneath. The drill that tests the watchdogs had its own bug of this kind: it sent signals by number, which mean *stop* on macOS and *continue* on Linux, so on Linux it broke nothing and reported a pass.
+- **Measured across operating systems**, not assumed: macOS (`sandbox-exec` plus a dedicated user), Linux with bubblewrap, and Linux with Landlock (ABI 7, kernel 6.18), where the Landlock enclosure passes 10 of 11 escape checks, the same as user separation plus bubblewrap. A Landlock proof of concept makes the kernel refuse forging, erasing or replacing the end-of-run record: 5 attacks succeed without it and 5 of 5 are refused with it, at a median cost of 88.5 µs (n = 100). Windows was measured for portability only; it has no enforcer yet, and the docs say so.
+- **The real NVIDIA OpenShell was built from source and probed.** Landlock was enforced, but the enforcement was not written to the OCSF audit log, and the default policy allows writes to `/tmp`. So `proofcheck` refuses to claim anything about outside-the-workspace effects from OpenShell's log alone, and that real log is pinned in the test suite.
+
+## Open-source plan
+
+The goal is for agent harnesses to ship with claim verification **on by default**, the way they ship with a sandbox today.
+
+1. **Finish the multi-OS evidence layer**: Linux (Landlock / bubblewrap) and macOS are working; Windows needs an enforcer. Every wall reports what it can and cannot prove (`guardrun --verify`) instead of failing silently.
+2. **Publish a small, stable core as a specification**: the contract format, the evidence format and the verdict rules D1–D4, in English, so other tools can implement them without adopting this stack.
+3. **Adapters, not a new platform**: Codex and qwc event logs and OpenShell OCSF logs are already supported. Next: Claude Code and OpenHands, and a GitHub Actions step (exit codes are 0 = PROVEN, 1 = DISPROVEN, 2 = UNVERIFIED).
+4. **An open benchmark that outsiders can contribute to**: tasks, honest solutions and deceptive solutions written by people who never see the verifier's rules. The blind-author protocol only works with other people, so the community is part of the method, not an add-on.
+
+Everything is MIT-licensed and free.
+
+## Run it yourself
+
+The verifier needs only Python 3:
 
 ```sh
-# 先に入れておくもの（どちらも別プロジェクト）
+git clone https://github.com/daigo0904/local-ai-stack
+cd local-ai-stack
+python3 verify/test_proofcheck.py && python3 verify/test_theory.py   # verifier and its properties
+verify/run_corpus --self-check                                       # the task corpus checks itself
+```
+
+The full stack targets macOS with [Ollama](https://ollama.com) and OpenClaw:
+
+```sh
 brew install ollama && ollama pull gemma4:26b
 npm i -g openclaw
-
-git clone https://github.com/ahogorirappa/local-ai-stack
-cd local-ai-stack
-./install              # 全部
-./install guards       # 一部だけ（guards / openclaw / tools / qwc）
-./install --check      # 何が入っているか
+./install            # everything (or: ./install verify | guards | openclaw | tools | qwc)
+./install --check    # what is installed and which secrets are still placeholders
+claw status          # the whole stack, including watchdog heartbeats
+claw run --agent codex --contract login.json "fix the login bug"   # seal → run → judge
 ```
 
-鍵と、自分を指すID（LINE・Discord のユーザーIDやチャンネルID）は**1つも入っていない**。
-`~/.openclaw/.env` に自分で埋める。ひな形には「何を入れるか」が日本語で書いてある。
+No keys or personal IDs are in this repository; secrets go in `~/.openclaw/.env`.
 
-```
-DISCORD_BOT_TOKEN=discord bot token please
-LINE_CHANNEL_ACCESS_TOKEN=line channel access token please
-```
+## Limitations
 
-`./install --check` と `openclaw/install --check` が、ひな形のまま残っている箇所を数える。
-**埋め忘れると静かに動かない**ので、0 になるまで確認する。
+- Claims are split by rules, not by a model. Paraphrases can slip past the splitter; unmatched assertions stay UNVERIFIED rather than being dropped.
+- A PROVEN verdict is relative to the sealed contract. A weak contract gives a weak PROVEN. Contract drafts can be generated by rules (`verify/contract-draft`), but on fresh tasks they still let lies through (1–2 per set), so drafts must be approved by a person before sealing.
+- External effects (production, databases, sent messages) are always UNVERIFIED: the verifier has no read-only window into them yet.
+- If every watchdog goes silent at once, or the machine itself dies, nothing inside can notice. An outside witness is needed, and the docs say so.
 
-## 動かしてみる
+## License
 
-```sh
-claw status      # 全体の状態。見張り3つの心拍も出る
-claw chat        # ターミナルでそのまま話す
-qwc              # コーディング（そのまま雑談もできる）
-voice-ai         # Option キーを押している間だけ聞く音声アシスタント
-```
-
-## この一式を貫いている考え方
-
-### 落ちるのではなく「黙る」ものとして扱う
-
-ここで起きた壊れ方は、どれもプロセスが生きたまま仕事だけ止まるものだった。
-cloudflared はトンネルが死んでも10時間気づかず、ollama は `/api/tags` が 200 を返しながら
-`/api/chat` だけ返らず、gateway はポートを開けたまま詰まった。
-
-`launchd` の `KeepAlive` はプロセスが死んだときにしか効かないので、どれにも無力だった。
-だから見張りは「立っているか」ではなく **「仕事ができるか」** を確かめる。
-ollama には実際に1トークン生成させ、LINE の入り口は LINE 自身に叩いてもらう。
-
-### 分けるのはプロセス、コードではない
-
-見張りは4つの別プロセスで、別の時計で、別の判断で動く。そこが独立の中身であって、
-同じ文字列を別々に持つことではない。判断を含まない道具は `guardlib.py` に集め、
-「何を見るか」「いつ手を出すか」だけを各見張りが持っている。
-最初は逆にして書き写していたが、**その日のうちに編集ミスで1つ壊した。**
-
-### 頼まれていないことはしない
-
-qwc は言葉づかいから雑談か作業かを見分ける。「そういえば消費税って10%だよね」と言っただけで
-ファイルが書き換わるのは、指示文に「問題を指摘されたら直せ」と書いてあるからで、
-作業中は正しくても雑談では困る。見分けを外したときは、書き換えに手が伸びた時点で確認する。
-
-### 小さいモデルは「頼む」では守らない
-
-計画モードでは `write_file` を「使わないでください」と頼むのではなく、道具ごと渡さない。
-26B のモデルは、頼むだけでは守らない。
-
-### 見張りに証明させる
-
-見張りは黙って壊れる。実際 `watchdog` は、直っていないのに「入れ直した」とログに書いていた。
-`guard-drill` がわざと壊して、**見張りが気づいた形跡が記録に出るか**を確かめる。
-サービスが戻ったことだけを見ると、訓練の後始末で戻したぶんを「見張りが直した」と取り違える。
-
-### できないことは、はっきり書く
-
-- 見張りが全部同時に黙ったとき
-- Mac ごと落ちたとき
-
-どちらも中の誰にも気づけない。外の機械が要る。ここを曖昧にすると
-「見張っているつもり」が一番危ない。
-
-## 測ったこと
-
-推測ではなく実測で決めた数字。
-
-| | |
-| :--- | :--- |
-| ollama が黙ってから自力復旧まで | **40秒** |
-| gateway が黙ってから入れ直しまで | 6分（連続2回で判断） |
-| qwc の雑談モードの指示文 | 3,136 → **1,402 トークン**（前処理 5.2秒 → 2.0秒） |
-| 生成中の `llama-server` の CPU | 7〜84%（待機・固まりはちょうど 0.0%） |
-| gemma4:26b の読み込み | 冷 36秒 / 温 1.7秒（だから常駐させる） |
-
-## つまずいた記録
-
-同じ罠を踏まないように残してある。詳しくは各ディレクトリの README に。
-
-- `launchd` の PATH には node が無い。`#!/usr/bin/env node` の道具はそのままでは必ず失敗する
-- `launchctl kickstart` は plist が外れていると効かない。戻り値を捨てると**嘘をつく見張り**ができる
-- `llama-server` だけ止めても障害は再現しない。ollama が自力で積み直す（26秒）
-- 14B に大きな引数のツール呼び出しをさせると必ず落ちる。保存は外の道具に出す
-- `-np 1` なので ollama は同時1件。裏で走らせると手元が待たされる
-
-## ライセンス
-
-MIT。ただし [OpenClaw](https://github.com/openclaw/openclaw) と
-[ollama](https://github.com/ollama/ollama) は別プロジェクトで、ここには入っていない。
+MIT. [OpenClaw](https://github.com/openclaw/openclaw) and [Ollama](https://github.com/ollama/ollama) are separate projects and are not included.
