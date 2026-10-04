@@ -1,5 +1,17 @@
 # ローカルAI一式
 
+> **技育展2026 の作品：guardrun**
+>
+> AIの「やりました」を、レシートで確かめる。AIを囲いの中で動かし、作業が終わったら
+> 「どのファイルが本当に変わったか」を囲いの外から調べて、作業ごとにレシートを出す。
+> AIが何と答えたかは、判定に使わない。
+>
+> - 触れる画面：<https://guardrun-receipts-2.onrender.com/>
+> - 本体：[`local-agent-tools/guardrun.py`](https://github.com/daigo0904/local-agent-tools/blob/main/guardrun.py)
+>
+> この一式（下）は、guardrun が生まれた場所。Mac 1台で AI を毎日動かしていて、
+> AIが黙って止まったり、やっていないことを「やった」と言ったりしたのがきっかけ。
+
 Mac 1台の中だけで動く AI の生活基盤。**外のAPIに一度も出ずに**、話し、調べ、コードを書き、
 自分が止まっていないかを見張る。
 
